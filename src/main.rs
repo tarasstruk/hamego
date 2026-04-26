@@ -1,8 +1,21 @@
 use std::fs;
+use std::path::PathBuf;
 use std::str::FromStr;
 use vsvg::{Color, DocumentTrait, LayerTrait, PathTrait};
 
+use clap::Parser;
 use itertools::Itertools;
+
+#[derive(Parser)]
+#[command(about = "Hameg HM1507 Oscilloscope HPGL to SVG converter")]
+struct Args {
+    /// Input HPGL file
+    input: PathBuf,
+
+    /// Output SVG file [default: <input>.svg]
+    #[arg(short, long)]
+    output: Option<PathBuf>,
+}
 
 const SCALE: f64 = 0.25;
 const WIDTH: f64 = 6540. * SCALE;
@@ -46,14 +59,19 @@ impl StartingPoint {
 }
 
 fn main() {
+    let args = Args::parse();
+
+    let output = args
+        .output
+        .unwrap_or_else(|| args.input.with_extension("svg"));
+
     let mut doc =
         vsvg::Document::new_with_page_size(vsvg::PageSize::Custom(WIDTH, HEIGHT, vsvg::Unit::Px));
 
     let mut layer = vsvg::Layer::default();
     layer.metadata_mut().name = Some("Layer 2".to_string());
 
-    let mut hpgl =
-        fs::read_to_string("samples/test.hpgl").expect("Should have been able to read the file");
+    let mut hpgl = fs::read_to_string(&args.input).expect("Should have been able to read the file");
 
     hpgl.retain(|c| c != '\n');
 
@@ -91,5 +109,5 @@ fn main() {
 
     // save to SVG
     doc.layers_mut().insert(2, layer);
-    doc.to_svg_file("test.svg").unwrap();
+    doc.to_svg_file(&output).unwrap();
 }
