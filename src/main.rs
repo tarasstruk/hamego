@@ -37,27 +37,6 @@ fn read_points<'a>(input: &'a str) -> impl 'a + Iterator<Item = (f64, f64)> {
     extract_points(input).map(|(x, y)| (x * SCALE, (4400. - y) * SCALE))
 }
 
-#[derive(Clone)]
-pub struct StartingPoint(Option<(f64, f64)>);
-
-impl Iterator for StartingPoint {
-    type Item = (f64, f64);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.0.take()
-    }
-}
-
-impl StartingPoint {
-    fn set(&mut self, value: (f64, f64)) {
-        self.0 = Some(value);
-    }
-
-    fn release(&mut self) -> Self {
-        StartingPoint(self.0.take())
-    }
-}
-
 fn main() {
     let args = Args::parse();
 
@@ -75,7 +54,7 @@ fn main() {
 
     hpgl.retain(|c| c != '\n');
 
-    let mut start = StartingPoint(None);
+    let mut start: Option<(f64, f64)> = None;
 
     let mut color = COLORS[0];
 
@@ -92,14 +71,14 @@ fn main() {
             let sub = &cmd[2..];
 
             if let Some(point) = read_points(sub).last() {
-                start.set(point)
+                start.replace(point);
             }
         }
 
         if cmd.starts_with("PD") {
             let sub = &cmd[2..];
 
-            let all_points = start.release().chain(read_points(sub));
+            let all_points = start.into_iter().chain(read_points(sub));
             let mut poly = vsvg::Path::from_points(all_points);
             poly.metadata_mut().color = color;
             poly.metadata_mut().stroke_width = 1.0;
