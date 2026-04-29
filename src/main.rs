@@ -35,6 +35,10 @@ struct Config {
     /// HPGL canvas height in plotter units
     #[arg(long, default_value_t = 4400.0)]
     height: f64,
+
+    /// Stroke width in SVG pixels
+    #[arg(long, default_value_t = 1.0)]
+    stroke_width: f64,
 }
 
 const COLORS: [Color; 5] = [
@@ -87,7 +91,7 @@ fn elaborate(
             let all_points = current.take().into_iter().chain(read_points(body, config));
             let mut poly = vsvg::Path::from_points(all_points);
             poly.metadata_mut().color = *color;
-            poly.metadata_mut().stroke_width = 1.0;
+            poly.metadata_mut().stroke_width = config.stroke_width;
             layer.paths.push(poly);
         }
     }
