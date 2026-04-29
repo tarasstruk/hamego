@@ -20,3 +20,9 @@ Options:
   -h, --help                         Print help
 ```
 
+## Testing
+
+```sh
+cargo nextest run
+```
+
