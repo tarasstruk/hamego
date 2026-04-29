@@ -1,5 +1,4 @@
-use anyhow::{Context, Result, anyhow};
-use std::fs;
+use anyhow::{Context, Result};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
@@ -54,6 +53,10 @@ fn read_points<'a>(input: &'a str, config: &'a Config) -> impl 'a + Iterator<Ite
     extract_points(input).map(|(x, y)| (x * config.scale, (config.height - y) * config.scale))
 }
 
+const PEN_UP: &str = "PU";
+const PEN_DOWN: &str = "PD";
+const SELECT_PEN: &str = "SP";
+
 fn elaborate(
     buf: &str,
     layer: &mut vsvg::Layer,
@@ -62,26 +65,26 @@ fn elaborate(
     config: &Config,
 ) {
     for cmd in buf.split(';') {
-        if cmd.starts_with("SP") {
-            let num = usize::from_str(&cmd[2..]).unwrap();
+        if let Some(body) = cmd.strip_prefix(SELECT_PEN) {
+            let num = usize::from_str(body).unwrap();
             *color = COLORS[num];
+            continue;
         }
 
-        if cmd.starts_with("PU") {
-            if cmd.len() == 2 {
+        if let Some(body) = cmd.strip_prefix(PEN_UP) {
+            // Handle the case when the PU; command comes without args
+            if body.is_empty() {
                 continue;
             }
-            let sub = &cmd[2..];
 
-            if let Some(point) = read_points(sub, config).last() {
+            if let Some(point) = read_points(body, config).last() {
                 current.replace(point);
             }
+            continue;
         }
 
-        if cmd.starts_with("PD") {
-            let sub = &cmd[2..];
-
-            let all_points = current.take().into_iter().chain(read_points(sub, config));
+        if let Some(body) = cmd.strip_prefix(PEN_DOWN) {
+            let all_points = current.take().into_iter().chain(read_points(body, config));
             let mut poly = vsvg::Path::from_points(all_points);
             poly.metadata_mut().color = *color;
             poly.metadata_mut().stroke_width = 1.0;
@@ -110,7 +113,7 @@ fn main() -> Result<()> {
     let mut layer = vsvg::Layer::default();
     layer.metadata_mut().name = Some("Layer 2".to_string());
 
-    let mut reader = BufReader::with_capacity(4096 * 16, File::open(&args.input)?);
+    let reader = BufReader::with_capacity(4096 * 16, File::open(&args.input)?);
 
     let mut chunks = reader.split(b';');
 
