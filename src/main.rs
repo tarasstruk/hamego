@@ -18,11 +18,25 @@ struct Args {
     /// Output SVG file [default: <input>.svg]
     #[arg(short, long)]
     output: Option<PathBuf>,
+
+    #[command(flatten)]
+    config: Config,
 }
 
-const SCALE: f64 = 0.25;
-const WIDTH: f64 = 6540. * SCALE;
-const HEIGHT: f64 = 4400. * SCALE;
+#[derive(Parser)]
+struct Config {
+    /// Scale factor for converting plotter units to SVG pixels
+    #[arg(long, default_value_t = 0.25)]
+    scale: f64,
+
+    /// HPGL canvas width in plotter units
+    #[arg(long, default_value_t = 6540.0)]
+    width: f64,
+
+    /// HPGL canvas height in plotter units
+    #[arg(long, default_value_t = 4400.0)]
+    height: f64,
+}
 
 const COLORS: [Color; 5] = [
     Color::KHAKI,
@@ -36,8 +50,8 @@ fn extract_points<'a>(input: &'a str) -> impl 'a + Iterator<Item = (f64, f64)> {
     input.split(',').map(|x| f64::from_str(x).unwrap()).tuples()
 }
 
-fn read_points<'a>(input: &'a str) -> impl 'a + Iterator<Item = (f64, f64)> {
-    extract_points(input).map(|(x, y)| (x * SCALE, (4400. - y) * SCALE))
+fn read_points<'a>(input: &'a str, config: &'a Config) -> impl 'a + Iterator<Item = (f64, f64)> {
+    extract_points(input).map(|(x, y)| (x * config.scale, (config.height - y) * config.scale))
 }
 
 fn elaborate(
@@ -45,6 +59,7 @@ fn elaborate(
     layer: &mut vsvg::Layer,
     current: &mut Option<(f64, f64)>,
     color: &mut Color,
+    config: &Config,
 ) {
     for cmd in buf.split(';') {
         if cmd.starts_with("SP") {
@@ -58,7 +73,7 @@ fn elaborate(
             }
             let sub = &cmd[2..];
 
-            if let Some(point) = read_points(sub).last() {
+            if let Some(point) = read_points(sub, config).last() {
                 current.replace(point);
             }
         }
@@ -66,7 +81,7 @@ fn elaborate(
         if cmd.starts_with("PD") {
             let sub = &cmd[2..];
 
-            let all_points = current.take().into_iter().chain(read_points(sub));
+            let all_points = current.take().into_iter().chain(read_points(sub, config));
             let mut poly = vsvg::Path::from_points(all_points);
             poly.metadata_mut().color = *color;
             poly.metadata_mut().stroke_width = 1.0;
@@ -77,13 +92,20 @@ fn elaborate(
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    let config = &args.config;
 
     let output = args
         .output
         .unwrap_or_else(|| args.input.with_extension("svg"));
 
-    let mut doc =
-        vsvg::Document::new_with_page_size(vsvg::PageSize::Custom(WIDTH, HEIGHT, vsvg::Unit::Px));
+    let svg_width = config.width * config.scale;
+    let svg_height = config.height * config.scale;
+
+    let mut doc = vsvg::Document::new_with_page_size(vsvg::PageSize::Custom(
+        svg_width,
+        svg_height,
+        vsvg::Unit::Px,
+    ));
 
     let mut layer = vsvg::Layer::default();
     layer.metadata_mut().name = Some("Layer 2".to_string());
@@ -100,7 +122,7 @@ fn main() -> Result<()> {
             break;
         }
         let buf = String::from_utf8(chunk)?;
-        elaborate(&buf, &mut layer, &mut current_point, &mut color);
+        elaborate(&buf, &mut layer, &mut current_point, &mut color, config);
     }
 
     doc.layers_mut().insert(2, layer);
