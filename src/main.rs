@@ -5,7 +5,8 @@ use std::path::PathBuf;
 use vsvg::{DocumentTrait, LayerTrait};
 
 use clap::Parser;
-use hamego::{COLORS, Config, elaborate};
+use hamego::{COLORS, elaborate};
+use hamego_core::Config;
 
 #[derive(Parser)]
 #[command(about = "Hameg HM1507 Oscilloscope HPGL to SVG converter")]
@@ -17,13 +18,32 @@ struct Args {
     #[arg(short, long)]
     output: Option<PathBuf>,
 
-    #[command(flatten)]
-    config: Config,
+    /// Scale factor for converting plotter units to SVG pixels
+    #[arg(long, default_value_t = 0.25)]
+    scale: f64,
+
+    /// HPGL canvas width in plotter units
+    #[arg(long, default_value_t = 6540.0)]
+    width: f64,
+
+    /// HPGL canvas height in plotter units
+    #[arg(long, default_value_t = 4400.0)]
+    height: f64,
+
+    /// Stroke width in SVG pixels
+    #[arg(long, default_value_t = 1.0)]
+    stroke_width: f64,
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let config = &args.config;
+
+    let config = Config {
+        scale: args.scale,
+        width: args.width,
+        height: args.height,
+        stroke_width: args.stroke_width,
+    };
 
     let output = args
         .output
@@ -53,7 +73,7 @@ fn main() -> Result<()> {
             break;
         }
         let buf = String::from_utf8(chunk)?;
-        elaborate(&buf, &mut layer, &mut current_point, &mut color, config);
+        elaborate(&buf, &mut layer, &mut current_point, &mut color, &config);
     }
 
     doc.layers_mut().insert(2, layer);
