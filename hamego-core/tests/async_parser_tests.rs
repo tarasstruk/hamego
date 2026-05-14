@@ -8,7 +8,9 @@ use embedded_io_async::Read;
 use futures_lite::future::block_on;
 use hamego_core::Config;
 
-use hamego_core::async_parser::{AsyncCommandHandler, parse_hpgl_async};
+use hamego_core::async_parser::{
+    AsyncCommandHandler, DEFAULT_CMD_BUF_SIZE, ParseError, parse_hpgl_async,
+};
 
 // --- Mock AsyncRead ---
 
@@ -92,7 +94,12 @@ fn run(input: &[u8]) -> Vec<Event> {
     let config = Config::default();
     let reader = SliceReader::new(input);
     let mut handler = RecordingHandler::new();
-    block_on(parse_hpgl_async(reader, &config, &mut handler));
+    block_on(parse_hpgl_async::<DEFAULT_CMD_BUF_SIZE, _, _>(
+        reader,
+        &config,
+        &mut handler,
+    ))
+    .expect("parse failed");
     handler.events
 }
 
@@ -106,7 +113,7 @@ fn async_parses_single_command() {
 }
 
 #[test]
-fn async_complete_fires_on_0x0A() {
+fn async_complete_fires_on_lf() {
     let events = run(b"SP1;\x0A");
     assert!(events.contains(&Event::Complete));
     assert_eq!(events.iter().filter(|e| **e == Event::Complete).count(), 1);
@@ -121,7 +128,7 @@ fn async_no_complete_on_eof() {
 }
 
 #[test]
-fn async_continues_after_0x0A() {
+fn async_continues_after_hpgl_block_ends() {
     // 0x0A signals end of one transmission but parsing continues for the next
     let events = run(b"SP1;\x0ASP2;\x0A");
     assert_eq!(
@@ -235,23 +242,37 @@ fn async_parity_with_sync_parser() {
         current_pen: 0,
         in_path: false,
     };
-    block_on(parse_hpgl_async(reader, &config, &mut ac));
+    block_on(parse_hpgl_async::<DEFAULT_CMD_BUF_SIZE, _, _>(
+        reader, &config, &mut ac,
+    ))
+    .expect("parity parse failed");
 
     assert_eq!(sc.path_count, ac.path_count, "path count mismatch");
     assert_eq!(sc.pen_counts, ac.pen_counts, "pen color counts mismatch");
 }
 
 #[test]
+fn async_command_too_long_returns_err() {
+    // Command body of 10 bytes with buffer size BS=4 → must return CommandTooLong
+    let input = b"SP11111;\x0A"; // "SP11111" = 7 bytes > BS=4
+    let config = Config::default();
+    let reader = SliceReader::new(input);
+    let mut handler = RecordingHandler::new();
+    let result = block_on(parse_hpgl_async::<4, _, _>(reader, &config, &mut handler));
+    assert_eq!(result, Err(ParseError::CommandTooLong));
+}
+
+#[test]
 fn async_buffer_overflow_handled() {
-    // Build a command longer than 256 bytes — parser must not panic
+    // Build a command longer than BS=4 bytes — parser must return Err, not panic
     let mut input: Vec<u8> = b"SP".to_vec();
-    for _ in 0..300 {
-        input.push(b'1');
-    }
+    input.extend(std::iter::repeat_n(b'1', 300));
     input.push(b';');
     input.push(0x0A);
 
-    // Should not panic; complete() is the only expected event (SP body truncated → parse fails silently)
-    let events = run(&input);
-    assert!(events.contains(&Event::Complete));
+    let config = Config::default();
+    let reader = SliceReader::new(&input);
+    let mut handler = RecordingHandler::new();
+    let result = block_on(parse_hpgl_async::<4, _, _>(reader, &config, &mut handler));
+    assert_eq!(result, Err(ParseError::CommandTooLong));
 }
