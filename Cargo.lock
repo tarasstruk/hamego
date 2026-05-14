@@ -451,9 +451,6 @@ dependencies = [
 [[package]]
 name = "hamego-core"
 version = "0.1.0"
-dependencies = [
- "itertools 0.13.0",
-]
 
 [[package]]
 name = "hamego-wasm"

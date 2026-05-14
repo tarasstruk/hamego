@@ -1,27 +1,17 @@
-use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::fs;
 
-use hamego::{COLORS, Config, elaborate};
+use hamego::{COLORS, elaborate};
+use hamego_core::Config;
 use vsvg::{Color, PathTrait};
 
 /// Parse the test5.hpgl sample into a vsvg layer using default config.
 fn parse_test5() -> vsvg::Layer {
     let config = Config::default();
     let mut layer = vsvg::Layer::default();
-    let mut current_point: Option<(f64, f64)> = None;
     let mut color = COLORS[0];
 
-    let reader = BufReader::new(File::open("samples/test5.hpgl").expect("sample file missing"));
-    let chunks = reader.split(b';');
-
-    for chunk in chunks {
-        let chunk = chunk.expect("failed to read chunk");
-        if chunk.starts_with(b"\r") {
-            break;
-        }
-        let buf = String::from_utf8(chunk).expect("invalid UTF-8");
-        elaborate(&buf, &mut layer, &mut current_point, &mut color, &config);
-    }
+    let content = fs::read_to_string("samples/test5.hpgl").expect("sample file missing");
+    elaborate(&content, &mut layer, &mut color, &config);
 
     layer
 }

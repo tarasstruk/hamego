@@ -1,5 +1,7 @@
-use std::str::FromStr;
-use itertools::Itertools;
+#![no_std]
+
+use core::fmt::Write;
+use core::str::FromStr;
 
 // --- Config ---
 
@@ -24,37 +26,54 @@ impl Default for Config {
 
 // --- Color mapping ---
 
-// Hex color strings for pens 0–4 matching the original COLORS array:
-// KHAKI, DARK_RED, GREEN, BLUE, GRAY
+// Hex color strings for pens 0–4: KHAKI, DARK_RED, GREEN, BLUE, GRAY
 pub const COLOR_HEX: [&str; 5] = ["#f0e68c", "#8b0000", "#008000", "#0000ff", "#808080"];
-
-// --- Draw commands ---
-
-pub enum DrawCommand {
-    SelectPen(usize),
-    PenUp(f64, f64),
-    PenDown(Vec<(f64, f64)>),
-}
 
 // --- Coordinate helpers ---
 
-pub fn extract_points(input: &str) -> impl '_ + Iterator<Item = (f64, f64)> {
-    input.split(',').map(|x| f64::from_str(x.trim()).unwrap()).tuples()
+/// Iterator over (x, y) pairs parsed from a comma-separated HPGL coordinate string.
+pub fn pair_iter(input: &str) -> impl Iterator<Item = (f64, f64)> + '_ {
+    let mut iter = input
+        .split(',')
+        .map(|s| f64::from_str(s.trim()).unwrap_or(0.0));
+    core::iter::from_fn(move || {
+        let x = iter.next()?;
+        let y = iter.next()?;
+        Some((x, y))
+    })
 }
 
-pub fn read_points<'a>(input: &'a str, config: &'a Config) -> impl 'a + Iterator<Item = (f64, f64)> {
-    extract_points(input).map(|(x, y)| (x * config.scale, (config.height - y) * config.scale))
+/// Convert raw HPGL plotter coordinates to SVG coordinates.
+pub fn read_points<'a>(
+    input: &'a str,
+    config: &'a Config,
+) -> impl Iterator<Item = (f64, f64)> + 'a {
+    pair_iter(input).map(|(x, y)| (x * config.scale, (config.height - y) * config.scale))
 }
 
-// --- Command parser ---
+// --- CommandHandler trait ---
+
+/// Streaming event handler for HPGL commands.
+/// Implement this trait to react to parsed commands without any heap allocation.
+pub trait CommandHandler {
+    fn select_pen(&mut self, pen: usize);
+    fn pen_up(&mut self, x: f64, y: f64);
+    /// Called before the first point of a PD segment.
+    fn pen_down_begin(&mut self);
+    /// Called for each point in the current PD segment.
+    fn pen_down_point(&mut self, x: f64, y: f64);
+    /// Called after the last point of a PD segment.
+    fn pen_down_end(&mut self);
+}
+
+// --- HPGL parser ---
 
 const PEN_UP: &str = "PU";
 const PEN_DOWN: &str = "PD";
 const SELECT_PEN: &str = "SP";
 
-/// Parse a full HPGL string into a list of DrawCommands.
-pub fn parse_commands(hpgl: &str, config: &Config) -> Vec<DrawCommand> {
-    let mut commands = Vec::new();
+/// Stream HPGL commands to a `CommandHandler`. Zero heap allocation.
+pub fn parse_hpgl(hpgl: &str, config: &Config, handler: &mut impl CommandHandler) {
     let mut current: Option<(f64, f64)> = None;
 
     for cmd in hpgl.split(';') {
@@ -62,7 +81,7 @@ pub fn parse_commands(hpgl: &str, config: &Config) -> Vec<DrawCommand> {
 
         if let Some(body) = cmd.strip_prefix(SELECT_PEN) {
             if let Ok(num) = usize::from_str(body.trim()) {
-                commands.push(DrawCommand::SelectPen(num));
+                handler.select_pen(num);
             }
             continue;
         }
@@ -74,63 +93,93 @@ pub fn parse_commands(hpgl: &str, config: &Config) -> Vec<DrawCommand> {
             }
             if let Some(point) = read_points(body, config).last() {
                 current = Some(point);
-                commands.push(DrawCommand::PenUp(point.0, point.1));
+                handler.pen_up(point.0, point.1);
             }
             continue;
         }
 
         if let Some(body) = cmd.strip_prefix(PEN_DOWN) {
-            let pts: Vec<(f64, f64)> = current.take().into_iter()
-                .chain(read_points(body.trim(), config))
-                .collect();
-            if !pts.is_empty() {
-                commands.push(DrawCommand::PenDown(pts));
+            handler.pen_down_begin();
+            // Include the last PU position as the first point of the polyline
+            if let Some((x, y)) = current.take() {
+                handler.pen_down_point(x, y);
             }
+            for (x, y) in read_points(body.trim(), config) {
+                handler.pen_down_point(x, y);
+            }
+            handler.pen_down_end();
+        }
+    }
+}
+
+// --- SvgWriter: CommandHandler that writes SVG markup ---
+
+/// Writes SVG `<polyline>` elements to any `core::fmt::Write` sink.
+pub struct SvgWriter<'a, W: Write> {
+    writer: &'a mut W,
+    current_color: &'static str,
+    stroke_width: f64,
+    first_point: bool,
+}
+
+impl<'a, W: Write> SvgWriter<'a, W> {
+    pub fn new(writer: &'a mut W, stroke_width: f64) -> Self {
+        Self {
+            writer,
+            current_color: COLOR_HEX[0],
+            stroke_width,
+            first_point: true,
+        }
+    }
+}
+
+impl<W: Write> CommandHandler for SvgWriter<'_, W> {
+    fn select_pen(&mut self, pen: usize) {
+        if pen < COLOR_HEX.len() {
+            self.current_color = COLOR_HEX[pen];
         }
     }
 
-    commands
+    fn pen_up(&mut self, _x: f64, _y: f64) {}
+
+    fn pen_down_begin(&mut self) {
+        let _ = write!(
+            self.writer,
+            r#"<polyline fill="none" stroke="{}" stroke-width="{}" points=""#,
+            self.current_color, self.stroke_width
+        );
+        self.first_point = true;
+    }
+
+    fn pen_down_point(&mut self, x: f64, y: f64) {
+        if !self.first_point {
+            let _ = self.writer.write_char(' ');
+        }
+        let _ = write!(self.writer, "{},{}", x, y);
+        self.first_point = false;
+    }
+
+    fn pen_down_end(&mut self) {
+        let _ = self.writer.write_str(r#""/>"#);
+    }
 }
 
-// --- SVG string generator ---
+// --- High-level SVG generator ---
 
-/// Generate a complete SVG string from HPGL input and config.
-pub fn generate_svg_string(hpgl: &str, config: &Config) -> String {
+/// Write a complete SVG document to the given `core::fmt::Write` sink.
+/// The caller supplies the buffer (e.g. `String`, `heapless::String<N>`).
+pub fn generate_svg(hpgl: &str, config: &Config, out: &mut impl Write) {
     let svg_width = config.width * config.scale;
     let svg_height = config.height * config.scale;
 
-    let commands = parse_commands(hpgl, config);
-
-    let mut out = String::new();
-    out.push_str(&format!(
+    let _ = write!(
+        out,
         r#"<svg xmlns="http://www.w3.org/2000/svg" width="{}" height="{}" viewBox="0 0 {} {}">"#,
         svg_width, svg_height, svg_width, svg_height
-    ));
+    );
 
-    let mut current_color = COLOR_HEX[0];
-    let stroke_width = config.stroke_width;
+    let mut svg_writer = SvgWriter::new(out, config.stroke_width);
+    parse_hpgl(hpgl, config, &mut svg_writer);
 
-    for cmd in &commands {
-        match cmd {
-            DrawCommand::SelectPen(n) => {
-                current_color = COLOR_HEX[*n];
-            }
-            DrawCommand::PenDown(pts) => {
-                let points_str: String = pts
-                    .iter()
-                    .map(|(x, y)| format!("{},{}", x, y))
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                out.push_str(&format!(
-                    r#"<polyline points="{}" fill="none" stroke="{}" stroke-width="{}"/>"#,
-                    points_str, current_color, stroke_width
-                ));
-            }
-            DrawCommand::PenUp(_, _) => {}
-        }
-    }
-
-    out.push_str("</svg>");
-    out
+    let _ = svg_writer.writer.write_str("</svg>");
 }
-

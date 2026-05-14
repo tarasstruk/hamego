@@ -1,6 +1,5 @@
 use anyhow::{Context, Result};
-use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::fs;
 use std::path::PathBuf;
 use vsvg::{DocumentTrait, LayerTrait};
 
@@ -61,20 +60,9 @@ fn main() -> Result<()> {
     let mut layer = vsvg::Layer::default();
     layer.metadata_mut().name = Some("Layer 2".to_string());
 
-    let reader = BufReader::with_capacity(4096 * 16, File::open(&args.input)?);
-
-    let mut chunks = reader.split(b';');
-
-    let mut current_point: Option<(f64, f64)> = None;
+    let content = fs::read_to_string(&args.input)?;
     let mut color = COLORS[0];
-
-    while let Some(Ok(chunk)) = chunks.next() {
-        if chunk.starts_with(b"\r") {
-            break;
-        }
-        let buf = String::from_utf8(chunk)?;
-        elaborate(&buf, &mut layer, &mut current_point, &mut color, &config);
-    }
+    elaborate(&content, &mut layer, &mut color, &config);
 
     doc.layers_mut().insert(2, layer);
     doc.to_svg_file(&output).context("Failed to write SVG file")

@@ -1,8 +1,6 @@
-use std::str::FromStr;
 use vsvg::{Color, PathTrait};
 
-
-pub use hamego_core::{Config, extract_points, read_points};
+pub use hamego_core::Config;
 
 pub const COLORS: [Color; 5] = [
     Color::KHAKI,
@@ -12,44 +10,50 @@ pub const COLORS: [Color; 5] = [
     Color::GRAY,
 ];
 
-const PEN_UP: &str = "PU";
-const PEN_DOWN: &str = "PD";
-const SELECT_PEN: &str = "SP";
+use hamego_core::{CommandHandler, parse_hpgl};
 
-pub fn elaborate(
-    buf: &str,
-    layer: &mut vsvg::Layer,
-    current: &mut Option<(f64, f64)>,
-    color: &mut Color,
-    config: &Config,
-) {
-    for cmd in buf.split(';') {
-        let cmd = cmd.trim();
+/// Adapter that converts streaming HPGL events into vsvg Layer paths.
+struct VsvgHandler<'a> {
+    layer: &'a mut vsvg::Layer,
+    color: &'a mut Color,
+    stroke_width: f64,
+    current_path: Vec<(f64, f64)>,
+}
 
-        if let Some(body) = cmd.strip_prefix(SELECT_PEN) {
-            if let Ok(num) = usize::from_str(body.trim()) {
-                *color = COLORS[num];
-            }
-            continue;
-        }
-
-        if let Some(body) = cmd.strip_prefix(PEN_UP) {
-            let body = body.trim();
-            if body.is_empty() {
-                continue;
-            }
-            if let Some(point) = read_points(body, config).last() {
-                current.replace(point);
-            }
-            continue;
-        }
-
-        if let Some(body) = cmd.strip_prefix(PEN_DOWN) {
-            let all_points = current.take().into_iter().chain(read_points(body.trim(), config));
-            let mut poly = vsvg::Path::from_points(all_points);
-            poly.metadata_mut().color = *color;
-            poly.metadata_mut().stroke_width = config.stroke_width;
-            layer.paths.push(poly);
+impl CommandHandler for VsvgHandler<'_> {
+    fn select_pen(&mut self, pen: usize) {
+        if pen < COLORS.len() {
+            *self.color = COLORS[pen];
         }
     }
+
+    fn pen_up(&mut self, _x: f64, _y: f64) {}
+
+    fn pen_down_begin(&mut self) {
+        self.current_path.clear();
+    }
+
+    fn pen_down_point(&mut self, x: f64, y: f64) {
+        self.current_path.push((x, y));
+    }
+
+    fn pen_down_end(&mut self) {
+        if self.current_path.is_empty() {
+            return;
+        }
+        let mut poly = vsvg::Path::from_points(self.current_path.drain(..));
+        poly.metadata_mut().color = *self.color;
+        poly.metadata_mut().stroke_width = self.stroke_width;
+        self.layer.paths.push(poly);
+    }
+}
+
+pub fn elaborate(buf: &str, layer: &mut vsvg::Layer, color: &mut Color, config: &Config) {
+    let mut handler = VsvgHandler {
+        layer,
+        color,
+        stroke_width: config.stroke_width,
+        current_path: Vec::new(),
+    };
+    parse_hpgl(buf, config, &mut handler);
 }
