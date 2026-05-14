@@ -1,9 +1,14 @@
 use anyhow::{Context, Result};
-use std::fs;
 use std::path::PathBuf;
 
 use clap::Parser;
-use hamego_core::{Config, generate_svg};
+use core::fmt::Write as _;
+use hamego_core::async_parser::{
+    AsyncCommandHandler, DEFAULT_DELIM, DEFAULT_IO_BUF_SIZE, DEFAULT_MAX_PTS, ParseError,
+    parse_hpgl_async,
+};
+use hamego_core::{CommandHandler, Config, SvgWriter};
+use tokio::io::AsyncReadExt;
 
 #[derive(Parser)]
 #[command(about = "Hameg HM1507 Oscilloscope HPGL to SVG converter")]
@@ -32,7 +37,66 @@ struct Args {
     stroke_width: f64,
 }
 
-fn main() -> Result<()> {
+// ---------------------------------------------------------------------------
+// Tokio file → embedded-io-async::Read bridge
+// ---------------------------------------------------------------------------
+
+struct TokioFileReader(tokio::fs::File);
+
+impl embedded_io_async::ErrorType for TokioFileReader {
+    type Error = embedded_io_async::ErrorKind;
+}
+
+impl embedded_io_async::Read for TokioFileReader {
+    async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
+        self.0
+            .read(buf)
+            .await
+            .map_err(|_| embedded_io_async::ErrorKind::Other)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AsyncCommandHandler adapter wrapping the no_std SvgWriter
+// ---------------------------------------------------------------------------
+
+struct AsyncSvgWriter<'a> {
+    inner: SvgWriter<'a, String>,
+}
+
+impl<'a> AsyncSvgWriter<'a> {
+    fn new(buf: &'a mut String, stroke_width: f64) -> Self {
+        Self {
+            inner: SvgWriter::new(buf, stroke_width),
+        }
+    }
+}
+
+impl AsyncCommandHandler for AsyncSvgWriter<'_> {
+    async fn select_pen(&mut self, pen: usize) {
+        self.inner.select_pen(pen);
+    }
+    async fn pen_up(&mut self, x: f64, y: f64) {
+        self.inner.pen_up(x, y);
+    }
+    async fn pen_down_begin(&mut self) {
+        self.inner.pen_down_begin();
+    }
+    async fn pen_down_point(&mut self, x: f64, y: f64) {
+        self.inner.pen_down_point(x, y);
+    }
+    async fn pen_down_end(&mut self) {
+        self.inner.pen_down_end();
+    }
+    async fn complete(&mut self) {}
+}
+
+// ---------------------------------------------------------------------------
+// Entry point
+// ---------------------------------------------------------------------------
+
+#[tokio::main]
+async fn main() -> Result<()> {
     let args = Args::parse();
 
     let config = Config {
@@ -46,9 +110,39 @@ fn main() -> Result<()> {
         .output
         .unwrap_or_else(|| args.input.with_extension("svg"));
 
-    let content = fs::read_to_string(&args.input)?;
-    let mut svg = String::new();
-    generate_svg(&content, &config, &mut svg);
+    let svg_width = config.width * config.scale;
+    let svg_height = config.height * config.scale;
 
-    fs::write(&output, svg).context("Failed to write SVG file")
+    let mut svg = String::new();
+
+    // SVG header
+    let _ = write!(
+        svg,
+        r#"<svg xmlns="http://www.w3.org/2000/svg" width="{}" height="{}" viewBox="0 0 {} {}">"#,
+        svg_width, svg_height, svg_width, svg_height
+    );
+
+    let file = tokio::fs::File::open(&args.input)
+        .await
+        .context("Failed to open input file")?;
+
+    let mut handler = AsyncSvgWriter::new(&mut svg, config.stroke_width);
+
+    parse_hpgl_async::<DEFAULT_IO_BUF_SIZE, DEFAULT_MAX_PTS, DEFAULT_DELIM, _, _>(
+        TokioFileReader(file),
+        &config,
+        &mut handler,
+    )
+    .await
+    .map_err(|e| match e {
+        ParseError::TooManyPoints => anyhow::anyhow!("HPGL path exceeds maximum point count"),
+        ParseError::TokenTooLong => anyhow::anyhow!("HPGL token too long"),
+        ParseError::Io(io) => anyhow::anyhow!("I/O error reading HPGL file: {:?}", io),
+    })?;
+
+    svg.push_str("</svg>");
+
+    tokio::fs::write(&output, svg)
+        .await
+        .context("Failed to write SVG file")
 }

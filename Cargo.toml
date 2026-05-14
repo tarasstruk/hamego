@@ -10,4 +10,6 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.102"
 clap = { version = "4.6.1", features = ["derive"] }
-hamego-core = { path = "hamego-core" }
+hamego-core = { path = "hamego-core", features = ["async"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util"] }
+embedded-io-async = "0.6"
