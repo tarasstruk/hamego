@@ -80,16 +80,20 @@ async fn dispatch<H: AsyncCommandHandler>(
     }
 }
 
+// Default delimiter byte — LF signals end of one HPGL transmission.
+pub const DEFAULT_DELIM: u8 = 0x0A;
+
 /// Parse HPGL from an async byte reader, streaming events to `handler`.
 ///
 /// - Commands are delimited by `;`.
-/// - `0x0A` (LF) signals end of a transmission: `handler.complete()` is called
+/// - `DELIM` byte signals end of a transmission: `handler.complete()` is called
 ///   and parsing continues — more transmissions may follow.
-/// - EOF without LF exits silently without calling `complete()`.
+///   Use [`DEFAULT_DELIM`] (`0x0A`, LF) for standard HPGL streams.
+/// - EOF without `DELIM` exits silently without calling `complete()`.
 /// - `BS` is both the I/O read buffer size and the max command length.
 ///   Returns [`ParseError::CommandTooLong`] if a command exceeds `BS` bytes.
 ///   Use [`DEFAULT_CMD_BUF_SIZE`] as a sensible default.
-pub async fn parse_hpgl_async<const BS: usize, R, H>(
+pub async fn parse_hpgl_async<const BS: usize, const DELIM: u8, R, H>(
     mut reader: R,
     config: &Config,
     handler: &mut H,
@@ -113,7 +117,7 @@ where
         };
 
         for &b in &io_buf[..n] {
-            if b == 0x0A {
+            if b == DELIM {
                 // Flush pending command, fire complete(), reset state
                 if cmd_len > 0 {
                     if let Ok(s) = core::str::from_utf8(&cmd_buf[..cmd_len]) {

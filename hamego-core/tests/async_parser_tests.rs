@@ -9,7 +9,7 @@ use futures_lite::future::block_on;
 use hamego_core::Config;
 
 use hamego_core::async_parser::{
-    AsyncCommandHandler, DEFAULT_CMD_BUF_SIZE, ParseError, parse_hpgl_async,
+    AsyncCommandHandler, DEFAULT_CMD_BUF_SIZE, DEFAULT_DELIM, ParseError, parse_hpgl_async,
 };
 
 // --- Mock AsyncRead ---
@@ -94,11 +94,13 @@ fn run(input: &[u8]) -> Vec<Event> {
     let config = Config::default();
     let reader = SliceReader::new(input);
     let mut handler = RecordingHandler::new();
-    block_on(parse_hpgl_async::<DEFAULT_CMD_BUF_SIZE, _, _>(
-        reader,
-        &config,
-        &mut handler,
-    ))
+    block_on(
+        parse_hpgl_async::<DEFAULT_CMD_BUF_SIZE, DEFAULT_DELIM, _, _>(
+            reader,
+            &config,
+            &mut handler,
+        ),
+    )
     .expect("parse failed");
     handler.events
 }
@@ -242,9 +244,9 @@ fn async_parity_with_sync_parser() {
         current_pen: 0,
         in_path: false,
     };
-    block_on(parse_hpgl_async::<DEFAULT_CMD_BUF_SIZE, _, _>(
-        reader, &config, &mut ac,
-    ))
+    block_on(
+        parse_hpgl_async::<DEFAULT_CMD_BUF_SIZE, DEFAULT_DELIM, _, _>(reader, &config, &mut ac),
+    )
     .expect("parity parse failed");
 
     assert_eq!(sc.path_count, ac.path_count, "path count mismatch");
@@ -258,7 +260,11 @@ fn async_command_too_long_returns_err() {
     let config = Config::default();
     let reader = SliceReader::new(input);
     let mut handler = RecordingHandler::new();
-    let result = block_on(parse_hpgl_async::<4, _, _>(reader, &config, &mut handler));
+    let result = block_on(parse_hpgl_async::<4, DEFAULT_DELIM, _, _>(
+        reader,
+        &config,
+        &mut handler,
+    ));
     assert_eq!(result, Err(ParseError::CommandTooLong));
 }
 
@@ -273,6 +279,10 @@ fn async_buffer_overflow_handled() {
     let config = Config::default();
     let reader = SliceReader::new(&input);
     let mut handler = RecordingHandler::new();
-    let result = block_on(parse_hpgl_async::<4, _, _>(reader, &config, &mut handler));
+    let result = block_on(parse_hpgl_async::<4, DEFAULT_DELIM, _, _>(
+        reader,
+        &config,
+        &mut handler,
+    ));
     assert_eq!(result, Err(ParseError::CommandTooLong));
 }
