@@ -1,11 +1,9 @@
 use anyhow::{Context, Result};
 use std::fs;
 use std::path::PathBuf;
-use vsvg::{DocumentTrait, LayerTrait};
 
 use clap::Parser;
-use hamego::{COLORS, elaborate};
-use hamego_core::Config;
+use hamego_core::{Config, generate_svg};
 
 #[derive(Parser)]
 #[command(about = "Hameg HM1507 Oscilloscope HPGL to SVG converter")]
@@ -48,22 +46,9 @@ fn main() -> Result<()> {
         .output
         .unwrap_or_else(|| args.input.with_extension("svg"));
 
-    let svg_width = config.width * config.scale;
-    let svg_height = config.height * config.scale;
-
-    let mut doc = vsvg::Document::new_with_page_size(vsvg::PageSize::Custom(
-        svg_width,
-        svg_height,
-        vsvg::Unit::Px,
-    ));
-
-    let mut layer = vsvg::Layer::default();
-    layer.metadata_mut().name = Some("Layer 2".to_string());
-
     let content = fs::read_to_string(&args.input)?;
-    let mut color = COLORS[0];
-    elaborate(&content, &mut layer, &mut color, &config);
+    let mut svg = String::new();
+    generate_svg(&content, &config, &mut svg);
 
-    doc.layers_mut().insert(2, layer);
-    doc.to_svg_file(&output).context("Failed to write SVG file")
+    fs::write(&output, svg).context("Failed to write SVG file")
 }
