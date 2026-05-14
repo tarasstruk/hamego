@@ -7,7 +7,7 @@ use core::str::FromStr;
 pub mod async_parser;
 #[cfg(feature = "async")]
 pub use async_parser::{
-    AsyncCommandHandler, DEFAULT_CMD_BUF_SIZE, DEFAULT_DELIM, parse_hpgl_async,
+    AsyncCommandHandler, DEFAULT_DELIM, DEFAULT_IO_BUF_SIZE, DEFAULT_MAX_PTS, parse_hpgl_async,
 };
 
 // --- Config ---
