@@ -4,5 +4,12 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+embedded-io-async = { version = "0.6", optional = true }
 
+[features]
+default = []
+async = ["embedded-io-async"]
 
+[dev-dependencies]
+embedded-io-async = "0.6"
+futures-lite = "2"
