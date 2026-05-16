@@ -2,13 +2,16 @@
 members = [".", "hamego-core", "hamego-wasm"]
 resolver = "2"
 
+[workspace.dependencies]
+embedded-io-async = "0.7"
+
 [package]
 name = "hamego"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-embedded-io-async = { version = "0.7"}
+embedded-io-async.workspace = true
 anyhow = "1.0.102"
 clap = { version = "4.6.1", features = ["derive"] }
 hamego-core = { path = "hamego-core" }
