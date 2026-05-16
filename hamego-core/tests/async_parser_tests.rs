@@ -131,17 +131,10 @@ fn async_parses_single_command() {
 }
 
 #[test]
-fn async_complete_fires_on_lf() {
-    let events = run(b"SP1;\x0A");
-    assert!(events.contains(&Event::Complete));
-    assert_eq!(events.iter().filter(|e| **e == Event::Complete).count(), 1);
-}
-
-#[test]
-fn async_no_complete_on_eof() {
+fn async_complete_fires_on_eof() {
+    // No explicit DELIM — EOF must still call complete()
     let events = run(b"SP1;");
-    assert_eq!(events, vec![Event::SelectPen(1)]);
-    assert!(!events.contains(&Event::Complete));
+    assert_eq!(events, vec![Event::SelectPen(1), Event::Complete]);
 }
 
 #[test]

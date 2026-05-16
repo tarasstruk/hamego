@@ -160,7 +160,7 @@ fn scale_xy(raw_x: f64, raw_y: f64, config: &Config) -> (f64, f64) {
 /// # Behaviour
 /// - Commands are delimited by `;`.
 /// - DELIM resets state and continues parsing (multiple transmissions supported).
-/// - EOF without DELIM exits silently without calling `complete()`.
+/// - EOF always calls `complete()` after flushing any pending state.
 #[allow(unused_assignments)] // macro_rules! do_complete! resets carry/pt_count; compiler sees them as dead assignments
 pub async fn parse_hpgl_async<const MAX_PTS: usize, const DELIM: u8, R, H>(
     mut reader: R,
@@ -183,6 +183,8 @@ where
     let mut pd_x: Option<f64> = None;
     // Points emitted in the current PD path
     let mut pt_count: usize = 0;
+    // Track whether we have pending data since the last complete()
+    let mut pending: bool = false;
 
     // Flush helpers as closures are not async — use a macro for the DELIM path
     macro_rules! do_complete {
@@ -193,6 +195,7 @@ where
             token.reset();
             prefix.reset();
             carry = None;
+            pending = false;
             state = State::Command;
             handler.complete().await;
         };
@@ -206,6 +209,7 @@ where
         };
 
         for &b in &io_buf[..n] {
+            pending = true;
             // ----------------------------------------------------------------
             // DELIM — flush current state, fire complete(), reset
             // ----------------------------------------------------------------
@@ -383,23 +387,27 @@ where
         }
     }
 
-    // EOF: flush trailing state without complete()
-    match state {
-        State::PdCoords => {
-            handler.pen_down_end().await;
-        }
-        State::PuCoords => {
-            if let (Some(rx), Some(ry)) = (pu_x, token.parse_f64()) {
-                let (sx, sy) = scale_xy(rx, ry, config);
-                handler.pen_up(sx, sy).await;
+    // EOF: flush trailing state and call complete() only if there was data
+    // since the last complete() (avoids double-complete when DELIM was last byte)
+    if pending {
+        match state {
+            State::PdCoords => {
+                handler.pen_down_end().await;
             }
-        }
-        State::SpBody => {
-            if let Some(pen) = token.parse_usize() {
-                handler.select_pen(pen).await;
+            State::PuCoords => {
+                if let (Some(rx), Some(ry)) = (pu_x, token.parse_f64()) {
+                    let (sx, sy) = scale_xy(rx, ry, config);
+                    handler.pen_up(sx, sy).await;
+                }
             }
+            State::SpBody => {
+                if let Some(pen) = token.parse_usize() {
+                    handler.select_pen(pen).await;
+                }
+            }
+            _ => {}
         }
-        _ => {}
+        handler.complete().await;
     }
 
     Ok(())
