@@ -3,9 +3,7 @@
 use core::fmt::Write;
 use core::str::FromStr;
 
-#[cfg(feature = "async")]
 pub mod async_parser;
-#[cfg(feature = "async")]
 pub use async_parser::{
     AsyncCommandHandler, DEFAULT_DELIM, DEFAULT_IO_BUF_SIZE, DEFAULT_MAX_PTS, parse_hpgl_async,
 };

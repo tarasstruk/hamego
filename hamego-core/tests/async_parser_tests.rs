@@ -1,4 +1,3 @@
-#![cfg(feature = "async")]
 // Integration tests for parse_hpgl_async — state-machine streaming parser.
 
 use core::sync::atomic::{AtomicBool, Ordering};

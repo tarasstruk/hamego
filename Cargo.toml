@@ -8,10 +8,10 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+embedded-io-async = { version = "0.7"}
 anyhow = "1.0.102"
 clap = { version = "4.6.1", features = ["derive"] }
-hamego-core = { path = "hamego-core", features = ["async"] }
-embassy-executor = { version = "0.7", features = ["arch-std", "executor-thread"] }
-embassy-sync = { version = "0.6" }
+hamego-core = { path = "hamego-core" }
+embassy-executor = { version = "0.10", features = ["platform-std", "executor-thread"] }
+embassy-sync = { version = "0.8" }
 critical-section = { version = "1", features = ["std"] }
-embedded-io-async = "0.6"
