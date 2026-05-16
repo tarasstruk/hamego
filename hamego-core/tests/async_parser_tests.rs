@@ -2,10 +2,10 @@
 // Integration tests for parse_hpgl_async — state-machine streaming parser.
 
 use core::sync::atomic::{AtomicBool, Ordering};
+use embassy_futures::block_on;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::pipe::Pipe;
 use embedded_io_async::Read;
-use futures_lite::future::block_on;
 use hamego_core::Config;
 use hamego_core::async_parser::{
     AsyncCommandHandler, DEFAULT_DELIM, DEFAULT_IO_BUF_SIZE, DEFAULT_MAX_PTS, ParseError,
@@ -527,7 +527,7 @@ fn async_pipe_reader_simulates_packet_arrival() {
         let writer = async {
             PIPE.write_all(b"SP1;PU100,200;").await;
             // Yield to the executor between packets, simulating a gap in arrival.
-            futures_lite::future::yield_now().await;
+            embassy_futures::yield_now().await;
             PIPE.write_all(b"PD300,400;\x0A").await;
             CLOSED.store(true, Ordering::Release);
         };
@@ -553,8 +553,8 @@ fn async_pipe_reader_simulates_packet_arrival() {
             handler.events
         };
 
-        // zip runs both futures concurrently (cooperative, single-threaded).
-        let (_, events) = futures_lite::future::zip(writer, parser).await;
+        // join runs both futures concurrently (cooperative, single-threaded).
+        let (_, events) = embassy_futures::join::join(writer, parser).await;
 
         assert_eq!(
             events,
