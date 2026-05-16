@@ -148,27 +148,30 @@ fn scale_xy(raw_x: f64, raw_y: f64, config: &Config) -> (f64, f64) {
 /// Parse HPGL from an async byte reader, streaming events to `handler`.
 ///
 /// # Generic parameters
-/// - `BS` — I/O read chunk size. Use [`DEFAULT_IO_BUF_SIZE`].
 /// - `MAX_PTS` — maximum coordinate pairs per PD path. Returns
 ///   [`ParseError::TooManyPoints`] if exceeded. Use [`DEFAULT_MAX_PTS`].
 /// - `DELIM` — byte that signals end of one transmission, causing
 ///   `handler.complete()` to be called. Use [`DEFAULT_DELIM`] (`0x0A`).
+///
+/// # Parameters
+/// - `io_buf` — externally-owned I/O read buffer. Caller controls size and
+///   lifetime; use a `static` buffer behind `Mutex` on embedded targets.
 ///
 /// # Behaviour
 /// - Commands are delimited by `;`.
 /// - DELIM resets state and continues parsing (multiple transmissions supported).
 /// - EOF without DELIM exits silently without calling `complete()`.
 #[allow(unused_assignments)] // macro_rules! do_complete! resets carry/pt_count; compiler sees them as dead assignments
-pub async fn parse_hpgl_async<const BS: usize, const MAX_PTS: usize, const DELIM: u8, R, H>(
+pub async fn parse_hpgl_async<const MAX_PTS: usize, const DELIM: u8, R, H>(
     mut reader: R,
     config: &Config,
     handler: &mut H,
+    io_buf: &mut [u8],
 ) -> Result<(), ParseError<R::Error>>
 where
     R: Read,
     H: AsyncCommandHandler,
 {
-    let mut io_buf = [0u8; BS];
     let mut state = State::Command;
     let mut prefix = Prefix::default();
     let mut token = Token::new();
@@ -196,7 +199,7 @@ where
     }
 
     loop {
-        let n = match reader.read(&mut io_buf).await {
+        let n = match reader.read(io_buf).await {
             Ok(0) => break,
             Ok(n) => n,
             Err(e) => return Err(ParseError::Io(e)),

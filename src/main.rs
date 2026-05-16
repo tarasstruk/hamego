@@ -1,57 +1,37 @@
 use anyhow::{Context, Result};
+use core::fmt::Write as _;
+use std::io::Read as StdRead;
 use std::path::PathBuf;
 
 use clap::Parser;
-use core::fmt::Write as _;
+use embassy_executor::Spawner;
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::mutex::Mutex;
 use hamego_core::async_parser::{
-    AsyncCommandHandler, DEFAULT_DELIM, DEFAULT_IO_BUF_SIZE, DEFAULT_MAX_PTS, ParseError,
-    parse_hpgl_async,
+    AsyncCommandHandler, DEFAULT_DELIM, DEFAULT_MAX_PTS, ParseError, parse_hpgl_async,
 };
 use hamego_core::{CommandHandler, Config, SvgWriter};
-use tokio::io::AsyncReadExt;
-
-#[derive(Parser)]
-#[command(about = "Hameg HM1507 Oscilloscope HPGL to SVG converter")]
-struct Args {
-    /// Input HPGL file
-    input: PathBuf,
-
-    /// Output SVG file [default: <input>.svg]
-    #[arg(short, long)]
-    output: Option<PathBuf>,
-
-    /// Scale factor for converting plotter units to SVG pixels
-    #[arg(long, default_value_t = 0.25)]
-    scale: f64,
-
-    /// HPGL canvas width in plotter units
-    #[arg(long, default_value_t = 6540.0)]
-    width: f64,
-
-    /// HPGL canvas height in plotter units
-    #[arg(long, default_value_t = 4400.0)]
-    height: f64,
-
-    /// Stroke width in SVG pixels
-    #[arg(long, default_value_t = 1.0)]
-    stroke_width: f64,
-}
 
 // ---------------------------------------------------------------------------
-// Tokio file → embedded-io-async::Read bridge
+// Static I/O buffer — always behind Mutex, same pattern on desktop & embedded
 // ---------------------------------------------------------------------------
 
-struct TokioFileReader(tokio::fs::File);
+static IO_BUFFER: Mutex<CriticalSectionRawMutex, [u8; 4096]> = Mutex::new([0u8; 4096]);
 
-impl embedded_io_async::ErrorType for TokioFileReader {
+// ---------------------------------------------------------------------------
+// std::fs::File → embedded-io-async::Read bridge (blocking, OK for desktop)
+// ---------------------------------------------------------------------------
+
+struct StdFileReader(std::fs::File);
+
+impl embedded_io_async::ErrorType for StdFileReader {
     type Error = embedded_io_async::ErrorKind;
 }
 
-impl embedded_io_async::Read for TokioFileReader {
+impl embedded_io_async::Read for StdFileReader {
     async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
         self.0
             .read(buf)
-            .await
             .map_err(|_| embedded_io_async::ErrorKind::Other)
     }
 }
@@ -92,11 +72,52 @@ impl AsyncCommandHandler for AsyncSvgWriter<'_> {
 }
 
 // ---------------------------------------------------------------------------
+// CLI args
+// ---------------------------------------------------------------------------
+
+#[derive(Parser)]
+#[command(about = "Hameg HM1507 Oscilloscope HPGL to SVG converter")]
+struct Args {
+    /// Input HPGL file
+    input: PathBuf,
+
+    /// Output SVG file [default: <input>.svg]
+    #[arg(short, long)]
+    output: Option<PathBuf>,
+
+    /// Scale factor for converting plotter units to SVG pixels
+    #[arg(long, default_value_t = 0.25)]
+    scale: f64,
+
+    /// HPGL canvas width in plotter units
+    #[arg(long, default_value_t = 6540.0)]
+    width: f64,
+
+    /// HPGL canvas height in plotter units
+    #[arg(long, default_value_t = 4400.0)]
+    height: f64,
+
+    /// Stroke width in SVG pixels
+    #[arg(long, default_value_t = 1.0)]
+    stroke_width: f64,
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
-#[tokio::main]
-async fn main() -> Result<()> {
+#[embassy_executor::main]
+async fn main(_spawner: Spawner) {
+    match run().await {
+        Ok(()) => std::process::exit(0),
+        Err(e) => {
+            eprintln!("Error: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+async fn run() -> Result<()> {
     let args = Args::parse();
 
     let config = Config {
@@ -114,24 +135,24 @@ async fn main() -> Result<()> {
     let svg_height = config.height * config.scale;
 
     let mut svg = String::new();
-
-    // SVG header
     let _ = write!(
         svg,
         r#"<svg xmlns="http://www.w3.org/2000/svg" width="{}" height="{}" viewBox="0 0 {} {}">"#,
         svg_width, svg_height, svg_width, svg_height
     );
 
-    let file = tokio::fs::File::open(&args.input)
-        .await
-        .context("Failed to open input file")?;
+    let file = std::fs::File::open(&args.input).context("Failed to open input file")?;
+    let reader = StdFileReader(file);
 
     let mut handler = AsyncSvgWriter::new(&mut svg, config.stroke_width);
 
-    parse_hpgl_async::<DEFAULT_IO_BUF_SIZE, DEFAULT_MAX_PTS, DEFAULT_DELIM, _, _>(
-        TokioFileReader(file),
+    let mut io_buf = IO_BUFFER.lock().await;
+
+    parse_hpgl_async::<DEFAULT_MAX_PTS, DEFAULT_DELIM, _, _>(
+        reader,
         &config,
         &mut handler,
+        &mut *io_buf,
     )
     .await
     .map_err(|e| match e {
@@ -142,7 +163,5 @@ async fn main() -> Result<()> {
 
     svg.push_str("</svg>");
 
-    tokio::fs::write(&output, svg)
-        .await
-        .context("Failed to write SVG file")
+    std::fs::write(&output, svg).context("Failed to write SVG file")
 }

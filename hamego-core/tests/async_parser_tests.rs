@@ -109,13 +109,13 @@ fn run(input: &[u8]) -> Vec<Event> {
     let config = Config::default();
     let reader = SliceReader::new(input);
     let mut handler = RecordingHandler::new();
-    block_on(parse_hpgl_async::<
-        DEFAULT_IO_BUF_SIZE,
-        DEFAULT_MAX_PTS,
-        DEFAULT_DELIM,
-        _,
-        _,
-    >(reader, &config, &mut handler))
+    let mut buf = [0u8; DEFAULT_IO_BUF_SIZE];
+    block_on(parse_hpgl_async::<DEFAULT_MAX_PTS, DEFAULT_DELIM, _, _>(
+        reader,
+        &config,
+        &mut handler,
+        &mut buf,
+    ))
     .expect("parse failed");
     handler.events
 }
@@ -248,13 +248,10 @@ fn async_parity_with_sync_parser() {
         pen_counts: [0; 5],
         current_pen: 0,
     };
-    block_on(parse_hpgl_async::<
-        DEFAULT_IO_BUF_SIZE,
-        DEFAULT_MAX_PTS,
-        DEFAULT_DELIM,
-        _,
-        _,
-    >(reader, &config, &mut ac))
+    let mut buf = [0u8; DEFAULT_IO_BUF_SIZE];
+    block_on(parse_hpgl_async::<DEFAULT_MAX_PTS, DEFAULT_DELIM, _, _>(
+        reader, &config, &mut ac, &mut buf,
+    ))
     .expect("parity parse failed");
 
     assert_eq!(sc.path_count, ac.path_count, "path count mismatch");
@@ -273,13 +270,13 @@ fn async_token_too_long_returns_err() {
     let config = Config::default();
     let reader = SliceReader::new(input);
     let mut handler = RecordingHandler::new();
-    let result = block_on(parse_hpgl_async::<
-        DEFAULT_IO_BUF_SIZE,
-        DEFAULT_MAX_PTS,
-        DEFAULT_DELIM,
-        _,
-        _,
-    >(reader, &config, &mut handler));
+    let mut buf = [0u8; DEFAULT_IO_BUF_SIZE];
+    let result = block_on(parse_hpgl_async::<DEFAULT_MAX_PTS, DEFAULT_DELIM, _, _>(
+        reader,
+        &config,
+        &mut handler,
+        &mut buf,
+    ));
     assert_eq!(result, Err(ParseError::TokenTooLong));
 }
 
@@ -291,13 +288,13 @@ fn async_too_many_points_returns_err() {
     let config = Config::default();
     let reader = SliceReader::new(input);
     let mut handler = RecordingHandler::new();
-    let result = block_on(parse_hpgl_async::<
-        DEFAULT_IO_BUF_SIZE,
-        4,
-        DEFAULT_DELIM,
-        _,
-        _,
-    >(reader, &config, &mut handler));
+    let mut buf = [0u8; DEFAULT_IO_BUF_SIZE];
+    let result = block_on(parse_hpgl_async::<4, DEFAULT_DELIM, _, _>(
+        reader,
+        &config,
+        &mut handler,
+        &mut buf,
+    ));
     assert_eq!(result, Err(ParseError::TooManyPoints));
 }
 
@@ -321,13 +318,13 @@ fn async_pd_large_streams_correctly() {
     let config = Config::default();
     let reader = SliceReader::new(&input);
     let mut handler = RecordingHandler::new();
-    block_on(parse_hpgl_async::<
-        DEFAULT_IO_BUF_SIZE,
-        DEFAULT_MAX_PTS,
-        DEFAULT_DELIM,
-        _,
-        _,
-    >(reader, &config, &mut handler))
+    let mut buf = [0u8; DEFAULT_IO_BUF_SIZE];
+    block_on(parse_hpgl_async::<DEFAULT_MAX_PTS, DEFAULT_DELIM, _, _>(
+        reader,
+        &config,
+        &mut handler,
+        &mut buf,
+    ))
     .expect("parse failed");
 
     let pd_points: usize = handler
@@ -491,9 +488,13 @@ fn async_small_io_buf() {
         pens: [0; 5],
         cur: 0,
     };
-    block_on(
-        parse_hpgl_async::<64, DEFAULT_MAX_PTS, DEFAULT_DELIM, _, _>(reader, &config, &mut async_c),
-    )
+    let mut buf = [0u8; 64];
+    block_on(parse_hpgl_async::<DEFAULT_MAX_PTS, DEFAULT_DELIM, _, _>(
+        reader,
+        &config,
+        &mut async_c,
+        &mut buf,
+    ))
     .expect("small-buf parse failed");
 
     assert_eq!(
