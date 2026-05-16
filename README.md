@@ -26,3 +26,25 @@ Options:
 cargo nextest run
 ```
 
+## WebAssembly (Browser)
+
+The `hamego-wasm` crate exposes two functions via `wasm-bindgen`:
+
+- `render_hpgl(hpgl, scale, width, height, stroke_width) -> String` — returns SVG string
+- `render_hpgl_to_dom(hpgl, scale, width, height, stroke_width, container_id)` — injects SVG into a DOM element
+
+### Build
+
+```sh
+wasm-pack build hamego-wasm --target web
+```
+
+The generated files will be in `hamego-wasm/pkg/`. Copy them next to `hamego-wasm/www/index.html` and open it with a local HTTP server:
+
+```sh
+cp -r hamego-wasm/pkg hamego-wasm/www/pkg
+cd hamego-wasm/www && python3 -m http.server
+```
+
+Then open `http://localhost:8000` in your browser, paste HPGL content and click **Render SVG**.
+

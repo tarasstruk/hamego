@@ -1,0 +1,13 @@
+[package]
+name = "hamego-core"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+embedded-io-async.workspace = true
+
+
+[dev-dependencies]
+embassy-sync = { version = "0.8" }
+embassy-futures = { version = "0.1" }
+critical-section = { version = "1", features = ["std"] }
