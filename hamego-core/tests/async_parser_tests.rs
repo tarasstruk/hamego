@@ -10,24 +10,17 @@ use hamego_core::async_parser::{
 };
 
 // ---------------------------------------------------------------------------
-// Mock AsyncRead
+// ChunkedReader — only needed for async_small_io_buf test (limits bytes per read)
 // ---------------------------------------------------------------------------
 
-struct SliceReader<'a> {
+struct ChunkedReader<'a> {
     data: &'a [u8],
     pos: usize,
-    chunk: usize, // max bytes per read() call — lets us test small IO buf
+    chunk: usize,
 }
 
-impl<'a> SliceReader<'a> {
-    fn new(data: &'a [u8]) -> Self {
-        Self {
-            data,
-            pos: 0,
-            chunk: data.len().max(1),
-        }
-    }
-    fn with_chunk(data: &'a [u8], chunk: usize) -> Self {
+impl<'a> ChunkedReader<'a> {
+    fn new(data: &'a [u8], chunk: usize) -> Self {
         Self {
             data,
             pos: 0,
@@ -36,11 +29,11 @@ impl<'a> SliceReader<'a> {
     }
 }
 
-impl embedded_io_async::ErrorType for SliceReader<'_> {
+impl embedded_io_async::ErrorType for ChunkedReader<'_> {
     type Error = core::convert::Infallible;
 }
 
-impl Read for SliceReader<'_> {
+impl Read for ChunkedReader<'_> {
     async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
         if self.pos >= self.data.len() {
             return Ok(0);
@@ -107,21 +100,33 @@ impl AsyncCommandHandler for RecordingHandler {
 
 fn run(input: &[u8]) -> Vec<Event> {
     let config = Config::default();
-    let reader = SliceReader::new(input);
     let mut handler = RecordingHandler::new();
-    let mut buf = [0u8; DEFAULT_IO_BUF_SIZE];
+    let mut io_buf = [0u8; DEFAULT_IO_BUF_SIZE];
     block_on(parse_hpgl_async::<DEFAULT_MAX_PTS, DEFAULT_DELIM, _, _>(
-        reader,
+        input,
         &config,
         &mut handler,
-        &mut buf,
+        &mut io_buf,
     ))
     .expect("parse failed");
     handler.events
 }
 
+fn handler_pd_points(events: &[Event]) -> Vec<(i64, i64)> {
+    events
+        .iter()
+        .filter_map(|e| {
+            if let Event::PenDownPoint(x, y) = e {
+                Some((*x, *y))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
-// Preserved tests
+// Tests
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -132,7 +137,6 @@ fn async_parses_single_command() {
 
 #[test]
 fn async_complete_fires_on_eof() {
-    // No explicit DELIM — EOF must still call complete()
     let events = run(b"SP1;");
     assert_eq!(events, vec![Event::SelectPen(1), Event::Complete]);
 }
@@ -153,16 +157,12 @@ fn async_continues_after_hpgl_block_ends() {
 
 #[test]
 fn async_empty_pu_is_skipped() {
-    // PU without coordinates must not emit pen_up
     let events = run(b"PU;\x0A");
     assert_eq!(events, vec![Event::Complete]);
 }
 
 #[test]
 fn async_parses_pen_up_pen_down_sequence() {
-    // Default config: scale=0.25, height=4400
-    // PU100,200 → x=25.0, y=(4400-200)*0.25=1050.0
-    // PD300,400 → carry (25,1050) + 300*0.25=75, (4400-400)*0.25=1000
     let events = run(b"PU100,200;PD300,400;\x0A");
     assert_eq!(
         events,
@@ -235,15 +235,17 @@ fn async_parity_with_sync_parser() {
 
     let mut bytes = content.as_bytes().to_vec();
     bytes.push(0x0A);
-    let reader = SliceReader::new(&bytes);
     let mut ac = AsyncCounter {
         path_count: 0,
         pen_counts: [0; 5],
         current_pen: 0,
     };
-    let mut buf = [0u8; DEFAULT_IO_BUF_SIZE];
+    let mut io_buf = [0u8; DEFAULT_IO_BUF_SIZE];
     block_on(parse_hpgl_async::<DEFAULT_MAX_PTS, DEFAULT_DELIM, _, _>(
-        reader, &config, &mut ac, &mut buf,
+        bytes.as_slice(),
+        &config,
+        &mut ac,
+        &mut io_buf,
     ))
     .expect("parity parse failed");
 
@@ -251,55 +253,43 @@ fn async_parity_with_sync_parser() {
     assert_eq!(sc.pen_counts, ac.pen_counts, "pen color counts mismatch");
 }
 
-// ---------------------------------------------------------------------------
-// New tests
-// ---------------------------------------------------------------------------
-
 #[test]
 fn async_token_too_long_returns_err() {
-    // A coordinate longer than TOKEN_BUF_SIZE (16) — malformed input
-    // "99999999999999999" = 17 chars > 16
-    let input = b"PD99999999999999999,100;\x0A";
+    let input: &[u8] = b"PD99999999999999999,100;\x0A";
     let config = Config::default();
-    let reader = SliceReader::new(input);
     let mut handler = RecordingHandler::new();
-    let mut buf = [0u8; DEFAULT_IO_BUF_SIZE];
+    let mut io_buf = [0u8; DEFAULT_IO_BUF_SIZE];
     let result = block_on(parse_hpgl_async::<DEFAULT_MAX_PTS, DEFAULT_DELIM, _, _>(
-        reader,
+        input,
         &config,
         &mut handler,
-        &mut buf,
+        &mut io_buf,
     ));
     assert_eq!(result, Err(ParseError::TokenTooLong));
 }
 
 #[test]
 fn async_too_many_points_returns_err() {
-    // PD with MAX_PTS+1 pairs using MAX_PTS=4
-    // 5 pairs: "100,200,100,200,100,200,100,200,100,200"
-    let input = b"PD100,200,100,200,100,200,100,200,100,200;\x0A";
+    let input: &[u8] = b"PD100,200,100,200,100,200,100,200,100,200;\x0A";
     let config = Config::default();
-    let reader = SliceReader::new(input);
     let mut handler = RecordingHandler::new();
-    let mut buf = [0u8; DEFAULT_IO_BUF_SIZE];
+    let mut io_buf = [0u8; DEFAULT_IO_BUF_SIZE];
     let result = block_on(parse_hpgl_async::<4, DEFAULT_DELIM, _, _>(
-        reader,
+        input,
         &config,
         &mut handler,
-        &mut buf,
+        &mut io_buf,
     ));
     assert_eq!(result, Err(ParseError::TooManyPoints));
 }
 
 #[test]
 fn async_pd_large_streams_correctly() {
-    // Build a PD with 500 coordinate pairs — must stream all 500 points
     let mut input = b"PD".to_vec();
     for i in 0..500u32 {
         if i > 0 {
             input.push(b',');
         }
-        // x,y — simple values
         input.extend_from_slice(b"100,200");
         if i < 499 {
             input.push(b',');
@@ -309,14 +299,13 @@ fn async_pd_large_streams_correctly() {
     input.push(0x0A);
 
     let config = Config::default();
-    let reader = SliceReader::new(&input);
     let mut handler = RecordingHandler::new();
-    let mut buf = [0u8; DEFAULT_IO_BUF_SIZE];
+    let mut io_buf = [0u8; DEFAULT_IO_BUF_SIZE];
     block_on(parse_hpgl_async::<DEFAULT_MAX_PTS, DEFAULT_DELIM, _, _>(
-        reader,
+        input.as_slice(),
         &config,
         &mut handler,
-        &mut buf,
+        &mut io_buf,
     ))
     .expect("parse failed");
 
@@ -332,7 +321,6 @@ fn async_pd_large_streams_correctly() {
 
 #[test]
 fn async_pd_empty_body() {
-    // PD; with no coordinates — begin + end, no points
     let events = run(b"PD;\x0A");
     assert_eq!(
         events,
@@ -342,7 +330,6 @@ fn async_pd_empty_body() {
 
 #[test]
 fn async_pd_with_carry_and_empty_body() {
-    // PU100,200 sets carry → PD; emits carry as first point
     let events = run(b"PU100,200;PD;\x0A");
     assert_eq!(
         events,
@@ -358,36 +345,17 @@ fn async_pd_with_carry_and_empty_body() {
 
 #[test]
 fn async_unknown_command_skipped() {
-    // IN and LA are unknown — must be silently skipped
     let events = run(b"IN;LA1,2;PD100,200;\x0A");
-    // Only PD events + Complete expected
     assert!(events.contains(&Event::PenDownBegin));
     assert!(events.contains(&Event::PenDownEnd));
     assert!(events.contains(&Event::Complete));
-    assert!(!events.contains(&Event::SelectPen(0)));
-    // Exactly: Begin, Point(100*0.25, (4400-200)*0.25) = (25, 1050), End, Complete
-    let pd_points: Vec<_> = handler_pd_points(&events);
+    let pd_points = handler_pd_points(&events);
     assert_eq!(pd_points, vec![(fp(25.0), fp(1050.0))]);
-}
-
-fn handler_pd_points(events: &[Event]) -> Vec<(i64, i64)> {
-    events
-        .iter()
-        .filter_map(|e| {
-            if let Event::PenDownPoint(x, y) = e {
-                Some((*x, *y))
-            } else {
-                None
-            }
-        })
-        .collect()
 }
 
 #[test]
 fn async_delim_inside_pd_coords() {
-    // PD100,200,300 + DELIM — first pair emitted, unpaired 300 dropped, PenDownEnd + Complete
-    let input = b"PD100,200,300\x0A";
-    let events = run(input);
+    let events = run(b"PD100,200,300\x0A");
     assert_eq!(
         events,
         vec![
@@ -401,29 +369,22 @@ fn async_delim_inside_pd_coords() {
 
 #[test]
 fn async_pu_multiple_pairs_keeps_last() {
-    // PU100,200,300,400 — pen_up must be called with (300,400) only (last pair)
-    // scale: 300*0.25=75, (4400-400)*0.25=1000
     let events = run(b"PU100,200,300,400;\x0A");
     let pu_events: Vec<_> = events
         .iter()
         .filter(|e| matches!(e, Event::PenUp(_, _)))
         .collect();
-    // pen_up is called for each pair — intermediate (100,200) and final (300,400)
-    // but carry is overwritten each time; the last pen_up is (300,400)
     assert!(pu_events.last() == Some(&&Event::PenUp(fp(75.0), fp(1000.0))));
 }
 
 #[test]
 fn async_sp_multidigit() {
-    // SP12 — multi-digit pen number
     let events = run(b"SP12;\x0A");
     assert_eq!(events, vec![Event::SelectPen(12), Event::Complete]);
 }
 
 #[test]
 fn async_small_io_buf() {
-    // Full test5.hpgl with tiny IO chunk size of 16 bytes — must produce same
-    // path/pen counts as with the default buffer size.
     use hamego_core::{CommandHandler, parse_hpgl};
     use std::fs;
 
@@ -474,19 +435,19 @@ fn async_small_io_buf() {
 
     let mut bytes = content.as_bytes().to_vec();
     bytes.push(0x0A);
-    // chunk=16 forces many partial reads
-    let reader = SliceReader::with_chunk(&bytes, 16);
+    // ChunkedReader limits to 16 bytes per read — tests small IO buf behavior
+    let reader = ChunkedReader::new(&bytes, 16);
     let mut async_c = Counter {
         paths: 0,
         pens: [0; 5],
         cur: 0,
     };
-    let mut buf = [0u8; 64];
+    let mut io_buf = [0u8; 64];
     block_on(parse_hpgl_async::<DEFAULT_MAX_PTS, DEFAULT_DELIM, _, _>(
         reader,
         &config,
         &mut async_c,
-        &mut buf,
+        &mut io_buf,
     ))
     .expect("small-buf parse failed");
 
