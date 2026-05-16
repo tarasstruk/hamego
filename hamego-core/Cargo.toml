@@ -13,3 +13,5 @@ async = ["embedded-io-async"]
 [dev-dependencies]
 embedded-io-async = "0.6"
 futures-lite = "2"
+embassy-sync = { version = "0.6" }
+critical-section = { version = "1", features = ["std"] }

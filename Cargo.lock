@@ -302,6 +302,8 @@ dependencies = [
 name = "hamego-core"
 version = "0.1.0"
 dependencies = [
+ "critical-section",
+ "embassy-sync",
  "embedded-io-async",
  "futures-lite",
 ]

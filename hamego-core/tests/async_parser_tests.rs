@@ -1,6 +1,9 @@
 #![cfg(feature = "async")]
 // Integration tests for parse_hpgl_async — state-machine streaming parser.
 
+use core::sync::atomic::{AtomicBool, Ordering};
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::pipe::Pipe;
 use embedded_io_async::Read;
 use futures_lite::future::block_on;
 use hamego_core::Config;
@@ -459,4 +462,111 @@ fn async_small_io_buf() {
         sync.pens, async_c.pens,
         "pen counts mismatch with small IO buf"
     );
+}
+
+// ---------------------------------------------------------------------------
+// ClosablePipeReader — wraps Pipe with EOF signaling via AtomicBool
+// ---------------------------------------------------------------------------
+
+/// Reads from an `embassy_sync::Pipe`. When the pipe is empty **and** `closed`
+/// is set to `true`, `read()` returns `Ok(0)` (EOF). Otherwise it awaits data
+/// like a normal pipe reader.
+struct ClosablePipeReader<'a, const N: usize> {
+    pipe: &'a Pipe<CriticalSectionRawMutex, N>,
+    closed: &'a AtomicBool,
+}
+
+impl<const N: usize> embedded_io_async::ErrorType for ClosablePipeReader<'_, N> {
+    type Error = core::convert::Infallible;
+}
+
+impl<const N: usize> Read for ClosablePipeReader<'_, N> {
+    async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
+        // Fast path: try non-blocking read first.
+        match self.pipe.try_read(buf) {
+            Ok(n) => return Ok(n),
+            Err(_empty) => {
+                // Pipe is empty. If the writer has closed, signal EOF.
+                if self.closed.load(Ordering::Acquire) {
+                    // Double-check: writer may have pushed bytes between
+                    // our try_read and the closed check.
+                    return match self.pipe.try_read(buf) {
+                        Ok(n) => Ok(n),
+                        Err(_) => Ok(0), // truly empty + closed → EOF
+                    };
+                }
+            }
+        }
+        // Writer is still alive — suspend until data arrives.
+        let n = self.pipe.read(buf).await;
+        Ok(n)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Test: Pipe-based packet arrival simulation with ClosablePipeReader
+// ---------------------------------------------------------------------------
+
+#[test]
+fn async_pipe_reader_simulates_packet_arrival() {
+    // Simulate two packets arriving in sequence via embassy_sync::Pipe:
+    // Packet 1: "SP1;PU100,200;" — pen select + move
+    // Packet 2: "PD300,400;\x0A"  — draw line + DELIM
+    //
+    // The writer task pushes packets then sets `closed = true` to signal EOF.
+    // The parser reads from ClosablePipeReader which returns Ok(0) once the
+    // pipe is empty and closed.
+    static PIPE: Pipe<CriticalSectionRawMutex, 1024> = Pipe::new();
+    static CLOSED: AtomicBool = AtomicBool::new(false);
+
+    // Reset statics (important if test binary runs multiple times)
+    PIPE.clear();
+    CLOSED.store(false, Ordering::Release);
+
+    block_on(async {
+        let writer = async {
+            PIPE.write_all(b"SP1;PU100,200;").await;
+            // Yield to the executor between packets, simulating a gap in arrival.
+            futures_lite::future::yield_now().await;
+            PIPE.write_all(b"PD300,400;\x0A").await;
+            CLOSED.store(true, Ordering::Release);
+        };
+
+        let parser = async {
+            let reader = ClosablePipeReader {
+                pipe: &PIPE,
+                closed: &CLOSED,
+            };
+            let config = Config::default();
+            let mut handler = RecordingHandler::new();
+            let mut io_buf = [0u8; DEFAULT_IO_BUF_SIZE];
+
+            parse_hpgl_async::<DEFAULT_MAX_PTS, DEFAULT_DELIM, _, _>(
+                reader,
+                &config,
+                &mut handler,
+                &mut io_buf,
+            )
+            .await
+            .expect("pipe parse failed");
+
+            handler.events
+        };
+
+        // zip runs both futures concurrently (cooperative, single-threaded).
+        let (_, events) = futures_lite::future::zip(writer, parser).await;
+
+        assert_eq!(
+            events,
+            vec![
+                Event::SelectPen(1),
+                Event::PenUp(fp(25.0), fp(1050.0)),
+                Event::PenDownBegin,
+                Event::PenDownPoint(fp(25.0), fp(1050.0)), // carry from PU
+                Event::PenDownPoint(fp(75.0), fp(1000.0)),
+                Event::PenDownEnd,
+                Event::Complete,
+            ]
+        );
+    });
 }
