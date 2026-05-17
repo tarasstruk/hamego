@@ -576,9 +576,7 @@ impl StateMachine {
         cur: &mut Cursor<'_>,
         handler: &mut H,
     ) -> Result<(), InnerError> {
-        while !cur.at_end() {
-            let b = cur.peek().unwrap();
-
+        while let Some(b) = cur.peek() {
             if b == DELIM {
                 cur.advance();
                 self.flush_delim(handler).await;
