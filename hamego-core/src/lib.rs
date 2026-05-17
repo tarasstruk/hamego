@@ -4,9 +4,7 @@ use core::fmt::Write;
 use core::str::FromStr;
 
 pub mod async_parser;
-pub use async_parser::{
-    AsyncCommandHandler, DEFAULT_DELIM, DEFAULT_IO_BUF_SIZE, DEFAULT_MAX_PTS, parse_hpgl_async,
-};
+pub use async_parser::{AsyncCommandHandler, DEFAULT_DELIM, DEFAULT_IO_BUF_SIZE, parse_hpgl_async};
 
 // --- Config ---
 

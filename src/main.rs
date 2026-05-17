@@ -7,9 +7,7 @@ use clap::Parser;
 use embassy_executor::Spawner;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::mutex::Mutex;
-use hamego_core::async_parser::{
-    AsyncCommandHandler, DEFAULT_DELIM, DEFAULT_MAX_PTS, ParseError, parse_hpgl_async,
-};
+use hamego_core::async_parser::{AsyncCommandHandler, DEFAULT_DELIM, ParseError, parse_hpgl_async};
 use hamego_core::{CommandHandler, Config, SvgWriter};
 
 // ---------------------------------------------------------------------------
@@ -148,18 +146,12 @@ async fn run() -> Result<()> {
 
     let mut io_buf = IO_BUFFER.lock().await;
 
-    parse_hpgl_async::<DEFAULT_MAX_PTS, DEFAULT_DELIM, _, _>(
-        reader,
-        &config,
-        &mut handler,
-        &mut *io_buf,
-    )
-    .await
-    .map_err(|e| match e {
-        ParseError::TooManyPoints => anyhow::anyhow!("HPGL path exceeds maximum point count"),
-        ParseError::TokenTooLong => anyhow::anyhow!("HPGL token too long"),
-        ParseError::Io(io) => anyhow::anyhow!("I/O error reading HPGL file: {:?}", io),
-    })?;
+    parse_hpgl_async::<DEFAULT_DELIM, _, _>(reader, &config, &mut handler, &mut *io_buf)
+        .await
+        .map_err(|e| match e {
+            ParseError::TokenTooLong => anyhow::anyhow!("HPGL token too long"),
+            ParseError::Io(io) => anyhow::anyhow!("I/O error reading HPGL file: {:?}", io),
+        })?;
 
     svg.push_str("</svg>");
 

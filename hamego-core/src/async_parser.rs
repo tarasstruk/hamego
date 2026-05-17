@@ -11,10 +11,6 @@ use crate::Config;
 /// Default I/O read chunk size for [`parse_hpgl_async`].
 pub const DEFAULT_IO_BUF_SIZE: usize = 256;
 
-/// Default maximum coordinate pairs allowed in a single PD path.
-/// `test5.hpgl` largest PD has ~640 pairs — 4096 is comfortable headroom.
-pub const DEFAULT_MAX_PTS: usize = 4096;
-
 /// Default delimiter byte — LF signals end of one HPGL transmission.
 pub const DEFAULT_DELIM: u8 = 0x0A;
 
@@ -28,8 +24,6 @@ const TOKEN_BUF_SIZE: usize = 16;
 /// Errors returned by [`parse_hpgl_async`].
 #[derive(Debug, PartialEq)]
 pub enum ParseError<E> {
-    /// A single PD path contained more coordinate pairs than `MAX_PTS`.
-    TooManyPoints,
     /// A number token exceeded [`TOKEN_BUF_SIZE`] bytes.
     TokenTooLong,
     /// The underlying reader returned an I/O error.
@@ -132,14 +126,12 @@ fn scale_xy(raw_x: f64, raw_y: f64, config: &Config) -> (f64, f64) {
 // ---------------------------------------------------------------------------
 
 enum InnerError {
-    TooManyPoints,
     TokenTooLong,
 }
 
 impl<E> From<InnerError> for ParseError<E> {
     fn from(e: InnerError) -> Self {
         match e {
-            InnerError::TooManyPoints => ParseError::TooManyPoints,
             InnerError::TokenTooLong => ParseError::TokenTooLong,
         }
     }
@@ -155,12 +147,9 @@ struct StateMachine {
     token: Token,
     /// Last PU position (scaled SVG coords) carried into the next PD as its first point.
     pu_carry: Option<(f64, f64)>,
-    /// Unscaled X of the current PU coordinate pair; `None` until the first comma is seen.
-    pu_pending_x: Option<f64>,
-    /// Unscaled X of the current PD coordinate pair; `None` until the first comma is seen.
-    pd_pending_x: Option<f64>,
-    /// Number of points emitted so far in the active PD path (used to enforce `MAX_PTS`).
-    pd_point_count: usize,
+    /// Unscaled X of the current coordinate pair (PU or PD); `None` until the first comma is seen.
+    /// Shared between PU and PD states — they are never active simultaneously.
+    pending_x: Option<f64>,
     /// `true` if any byte has been received since the last `complete()` call.
     /// Prevents a spurious `complete()` when DELIM was the very last byte.
     has_pending_data: bool,
@@ -174,9 +163,7 @@ impl StateMachine {
             prefix: Prefix::default(),
             token: Token::new(),
             pu_carry: None,
-            pu_pending_x: None,
-            pd_pending_x: None,
-            pd_point_count: 0,
+            pending_x: None,
             has_pending_data: false,
             config: config.clone(),
         }
@@ -197,16 +184,12 @@ impl StateMachine {
                 handler.pen_down_begin().await;
                 if let Some((cx, cy)) = self.pu_carry.take() {
                     handler.pen_down_point(cx, cy).await;
-                    self.pd_point_count = 1;
-                } else {
-                    self.pd_point_count = 0;
                 }
-                self.pd_pending_x = None;
+                self.pending_x = None;
                 self.token.reset();
                 self.state = State::PdCoords;
             } else if self.prefix.matches(b"PU") {
-                self.pu_pending_x = None;
-                self.pd_pending_x = None;
+                self.pending_x = None;
                 self.token.reset();
                 self.state = State::PuCoords;
             } else if self.prefix.matches(b"SP") {
@@ -219,37 +202,27 @@ impl StateMachine {
         }
     }
 
-    async fn handle_pd_byte<const MAX_PTS: usize, H: AsyncCommandHandler>(
+    async fn handle_pd_byte<H: AsyncCommandHandler>(
         &mut self,
         b: u8,
         handler: &mut H,
     ) -> Result<(), InnerError> {
         if b == b';' {
-            if let (Some(rx), Some(ry)) = (self.pd_pending_x.take(), self.token.parse_f64()) {
+            if let (Some(rx), Some(ry)) = (self.pending_x.take(), self.token.parse_f64()) {
                 let (sx, sy) = scale_xy(rx, ry, &self.config);
-                if self.pd_point_count >= MAX_PTS {
-                    return Err(InnerError::TooManyPoints);
-                }
                 handler.pen_down_point(sx, sy).await;
-                self.pd_point_count += 1;
             }
-            self.pd_pending_x = None;
             self.token.reset();
-            self.pd_point_count = 0;
             handler.pen_down_end().await;
             self.state = State::Command;
         } else if b == b',' {
-            if self.pd_pending_x.is_none() {
-                self.pd_pending_x = self.token.parse_f64();
+            if self.pending_x.is_none() {
+                self.pending_x = self.token.parse_f64();
                 self.token.reset();
             } else {
-                if let (Some(rx), Some(ry)) = (self.pd_pending_x.take(), self.token.parse_f64()) {
+                if let (Some(rx), Some(ry)) = (self.pending_x.take(), self.token.parse_f64()) {
                     let (sx, sy) = scale_xy(rx, ry, &self.config);
-                    if self.pd_point_count >= MAX_PTS {
-                        return Err(InnerError::TooManyPoints);
-                    }
                     handler.pen_down_point(sx, sy).await;
-                    self.pd_point_count += 1;
                 }
                 self.token.reset();
             }
@@ -265,7 +238,7 @@ impl StateMachine {
         handler: &mut H,
     ) -> Result<(), InnerError> {
         if b == b';' {
-            if let (Some(rx), Some(ry)) = (self.pu_pending_x.take(), self.token.parse_f64()) {
+            if let (Some(rx), Some(ry)) = (self.pending_x.take(), self.token.parse_f64()) {
                 let (sx, sy) = scale_xy(rx, ry, &self.config);
                 self.pu_carry = Some((sx, sy));
                 handler.pen_up(sx, sy).await;
@@ -273,11 +246,11 @@ impl StateMachine {
             self.token.reset();
             self.state = State::Command;
         } else if b == b',' {
-            if self.pu_pending_x.is_none() {
-                self.pu_pending_x = self.token.parse_f64();
+            if self.pending_x.is_none() {
+                self.pending_x = self.token.parse_f64();
                 self.token.reset();
             } else {
-                if let (Some(rx), Some(ry)) = (self.pu_pending_x.take(), self.token.parse_f64()) {
+                if let (Some(rx), Some(ry)) = (self.pending_x.take(), self.token.parse_f64()) {
                     let (sx, sy) = scale_xy(rx, ry, &self.config);
                     self.pu_carry = Some((sx, sy));
                     handler.pen_up(sx, sy).await;
@@ -314,14 +287,14 @@ impl StateMachine {
     async fn flush_delim<H: AsyncCommandHandler>(&mut self, handler: &mut H) {
         match self.state {
             State::PdCoords => {
-                if let (Some(rx), Some(ry)) = (self.pd_pending_x.take(), self.token.parse_f64()) {
+                if let (Some(rx), Some(ry)) = (self.pending_x.take(), self.token.parse_f64()) {
                     let (sx, sy) = scale_xy(rx, ry, &self.config);
                     handler.pen_down_point(sx, sy).await;
                 }
                 handler.pen_down_end().await;
             }
             State::PuCoords => {
-                if let (Some(rx), Some(ry)) = (self.pu_pending_x.take(), self.token.parse_f64()) {
+                if let (Some(rx), Some(ry)) = (self.pending_x.take(), self.token.parse_f64()) {
                     let (sx, sy) = scale_xy(rx, ry, &self.config);
                     self.pu_carry = Some((sx, sy));
                     handler.pen_up(sx, sy).await;
@@ -335,9 +308,7 @@ impl StateMachine {
             _ => {}
         }
         // reset all state
-        self.pu_pending_x = None;
-        self.pd_pending_x = None;
-        self.pd_point_count = 0;
+        self.pending_x = None;
         self.token.reset();
         self.prefix.reset();
         self.pu_carry = None;
@@ -359,7 +330,7 @@ impl StateMachine {
                 handler.pen_down_end().await;
             }
             State::PuCoords => {
-                if let (Some(rx), Some(ry)) = (self.pu_pending_x, self.token.parse_f64()) {
+                if let (Some(rx), Some(ry)) = (self.pending_x, self.token.parse_f64()) {
                     let (sx, sy) = scale_xy(rx, ry, &self.config);
                     handler.pen_up(sx, sy).await;
                 }
@@ -378,7 +349,7 @@ impl StateMachine {
     // Main byte dispatch
     // -----------------------------------------------------------------------
 
-    async fn feed_byte<const MAX_PTS: usize, const DELIM: u8, H: AsyncCommandHandler>(
+    async fn feed_byte<const DELIM: u8, H: AsyncCommandHandler>(
         &mut self,
         b: u8,
         handler: &mut H,
@@ -395,7 +366,7 @@ impl StateMachine {
                 self.handle_command_byte(b, handler).await;
             }
             State::PdCoords => {
-                self.handle_pd_byte::<MAX_PTS, H>(b, handler).await?;
+                self.handle_pd_byte(b, handler).await?;
             }
             State::PuCoords => {
                 self.handle_pu_byte(b, handler).await?;
@@ -420,12 +391,11 @@ impl StateMachine {
 /// Parse HPGL from an async byte reader, streaming events to `handler`.
 ///
 /// # Generic parameters
-/// - `MAX_PTS` — maximum coordinate pairs per PD path.
 /// - `DELIM` — byte that signals end of one HPGL transmission.
 ///
 /// # Parameters
 /// - `io_buf` — externally-owned I/O read buffer.
-pub async fn parse_hpgl_async<const MAX_PTS: usize, const DELIM: u8, R, H>(
+pub async fn parse_hpgl_async<const DELIM: u8, R, H>(
     mut reader: R,
     config: &Config,
     handler: &mut H,
@@ -444,7 +414,7 @@ where
             Err(e) => return Err(ParseError::Io(e)),
         };
         for &b in &io_buf[..n] {
-            sm.feed_byte::<MAX_PTS, DELIM, H>(b, handler)
+            sm.feed_byte::<DELIM, H>(b, handler)
                 .await
                 .map_err(ParseError::from)?;
         }
