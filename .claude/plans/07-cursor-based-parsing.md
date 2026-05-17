@@ -186,3 +186,23 @@ parse_hpgl_async
 - `hamego-core/src/async_parser.rs` — complete rewrite per above
 - No test changes needed — all 16 tests pass
 
+---
+
+## Problem 6: `EFF_BUF` overflow with large IO buffers
+
+**Symptom**: `cargo r -- samples/test5.hpgl` → `Error: HPGL token too long`
+
+**Root cause**: `feed_bytes` prepends carry to the **entire** incoming `data` chunk into a fixed-size stack buffer:
+```rust
+const EFF_BUF: usize = CARRY_BUF_SIZE + DEFAULT_IO_BUF_SIZE + 256; // = 528
+```
+But `main.rs` uses `io_buf = [0u8; 4096]`. When carry exists (even 1 byte), `total = carry_len + 4096 > 528` → `TokenTooLong`.
+
+**Key insight**: `CARRY_BUF_SIZE` (16 bytes) is large enough to hold one or two numbers plus a comma (e.g. `"1234,5678"` = 9 bytes). We only need a few bytes from the new chunk to complete the straddled token — **not the entire chunk**.
+
+**Resolution — 2-pass approach**:
+1. If `carry_len > 0`: scan `data` for the first delimiter (`,`, `;`, DELIM) — typically ≤ 15 bytes in. Append only those bytes to carry → combined ≤ 32 bytes. Parse the combined buffer (tiny stack alloc). Advance `data` offset past the consumed head bytes.
+2. Parse the rest of `data[offset..]` directly via Cursor — zero-copy, no size limit.
+
+This removes the dependency between `EFF_BUF` and the caller's `io_buf` size. The stack allocation is bounded at **32 bytes** regardless of IO buffer size.
+

@@ -510,42 +510,72 @@ impl StateMachine {
     ) -> Result<(), InnerError> {
         self.has_pending_data = true;
 
-        // Prepend any carry bytes to this chunk so handlers see a contiguous slice.
-        let effective_data: &[u8] = if self.carry_len > 0 {
-            // Stack-allocate a combined buffer.
-            let total = self.carry_len + data.len();
-            if total > CARRY_BUF_SIZE + DEFAULT_IO_BUF_SIZE + 64 {
-                return Err(InnerError::TokenTooLong);
-            }
-            // We cannot return a reference to a stack-local without unsafe.
-            // Instead, use a heap-free trick: extend carry_buf temporarily.
-            // carry_buf is CARRY_BUF_SIZE; data can be up to DEFAULT_IO_BUF_SIZE.
-            // Use a fixed-size stack array big enough.
-            // We handle this in the loop below via `effective_buf`.
-            data // placeholder — actual logic below
-        } else {
-            data
-        };
-        let _ = effective_data; // suppress warning
+        // Pass 1 (carry): if carry bytes exist from the previous chunk, complete
+        // the straddled token by appending only the head of `data` up to and
+        // including the first delimiter (`,`, `;`, or DELIM).  The combined
+        // buffer is at most CARRY_BUF_SIZE * 2 bytes — bounded regardless of
+        // the caller's io_buf size.
+        let data = if self.carry_len > 0 {
+            // Carry holds a partial token (up to CARRY_BUF_SIZE bytes).
+            // We need enough bytes from `data` to complete the straddled number(s).
+            // A coordinate pair is "x,y" — at most two numbers. Count how many
+            // delimiters are still needed: 1 if carry already has a comma (x is
+            // done, need end of y), 2 otherwise (need end of x and end of y).
+            let commas_in_carry = self.carry_buf[..self.carry_len]
+                .iter()
+                .filter(|&&b| b == b',')
+                .count();
+            let delimiters_needed = if commas_in_carry >= 1 { 1usize } else { 2 };
 
-        // Use a stack buffer for carry + data concatenation.
-        const EFF_BUF: usize = CARRY_BUF_SIZE + DEFAULT_IO_BUF_SIZE + 256;
-        let mut eff_buf = [0u8; EFF_BUF];
-        let eff_slice: &[u8] = if self.carry_len > 0 {
-            let total = self.carry_len + data.len();
-            if total > EFF_BUF {
+            // Scan `data` for `delimiters_needed` delimiters.
+            let mut found = 0usize;
+            let head_len = data
+                .iter()
+                .position(|&b| {
+                    if b == b',' || b == b';' || b == DELIM {
+                        found += 1;
+                        found >= delimiters_needed
+                    } else {
+                        false
+                    }
+                })
+                .map(|p| p + 1)
+                .unwrap_or(data.len().min(CARRY_BUF_SIZE));
+
+            // Build combined = carry ++ data[..head_len].
+            const COMBINED: usize = CARRY_BUF_SIZE * 2 + 2;
+            let total = self.carry_len + head_len;
+            if total > COMBINED {
                 return Err(InnerError::TokenTooLong);
             }
-            eff_buf[..self.carry_len].copy_from_slice(&self.carry_buf[..self.carry_len]);
-            eff_buf[self.carry_len..total].copy_from_slice(data);
+            let mut combined = [0u8; COMBINED];
+            combined[..self.carry_len].copy_from_slice(&self.carry_buf[..self.carry_len]);
+            combined[self.carry_len..total].copy_from_slice(&data[..head_len]);
             self.carry_len = 0;
-            &eff_buf[..total]
+
+            // Process pass-1 combined slice.
+            let mut cur1 = Cursor::new(&combined[..total]);
+            self.run_cursor::<DELIM, H>(&mut cur1, handler).await?;
+            // Handlers already called carry_push for any Incomplete remainder.
+
+            &data[head_len..]
         } else {
             data
         };
 
-        let mut cur = Cursor::new(eff_slice);
+        // Pass 2: process `data` (either the full original slice or the tail
+        // after the carry-head) directly via a Cursor — zero copy, no size limit.
+        let mut cur = Cursor::new(data);
+        self.run_cursor::<DELIM, H>(&mut cur, handler).await?;
+        Ok(())
+    }
 
+    /// Inner dispatch loop over a `Cursor` — shared by pass-1 (carry) and pass-2 (data).
+    async fn run_cursor<const DELIM: u8, H: AsyncCommandHandler>(
+        &mut self,
+        cur: &mut Cursor<'_>,
+        handler: &mut H,
+    ) -> Result<(), InnerError> {
         while !cur.at_end() {
             let b = cur.peek().unwrap();
 
@@ -560,19 +590,18 @@ impl StateMachine {
 
             match self.state {
                 State::Command => {
-                    self.handle_command::<DELIM, H>(&mut cur, handler).await;
+                    self.handle_command::<DELIM, H>(cur, handler).await;
                 }
                 State::PdCoords => {
-                    self.handle_pd::<DELIM, H>(&mut cur, handler).await?;
+                    self.handle_pd::<DELIM, H>(cur, handler).await?;
                 }
                 State::PuCoords => {
-                    self.handle_pu::<DELIM, H>(&mut cur, handler).await?;
+                    self.handle_pu::<DELIM, H>(cur, handler).await?;
                 }
                 State::SpBody => {
-                    self.handle_sp::<DELIM, H>(&mut cur, handler).await?;
+                    self.handle_sp::<DELIM, H>(cur, handler).await?;
                 }
                 State::Skip => {
-                    // Discard until ';' or DELIM.
                     while let Some(b) = cur.peek() {
                         if b == b';' || b == DELIM {
                             break;
