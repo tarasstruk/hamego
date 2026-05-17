@@ -7,8 +7,7 @@ use embassy_sync::pipe::Pipe;
 use embedded_io_async::Read;
 use hamego_core::Config;
 use hamego_core::async_parser::{
-    AsyncCommandHandler, DEFAULT_DELIM, DEFAULT_IO_BUF_SIZE, DEFAULT_MAX_PTS, ParseError,
-    parse_hpgl_async,
+    AsyncCommandHandler, DEFAULT_DELIM, DEFAULT_IO_BUF_SIZE, ParseError, parse_hpgl_async,
 };
 
 // ---------------------------------------------------------------------------
@@ -104,7 +103,7 @@ fn run(input: &[u8]) -> Vec<Event> {
     let config = Config::default();
     let mut handler = RecordingHandler::new();
     let mut io_buf = [0u8; DEFAULT_IO_BUF_SIZE];
-    block_on(parse_hpgl_async::<DEFAULT_MAX_PTS, DEFAULT_DELIM, _, _>(
+    block_on(parse_hpgl_async::<DEFAULT_DELIM, _, _>(
         input,
         &config,
         &mut handler,
@@ -243,7 +242,7 @@ fn async_parity_with_sync_parser() {
         current_pen: 0,
     };
     let mut io_buf = [0u8; DEFAULT_IO_BUF_SIZE];
-    block_on(parse_hpgl_async::<DEFAULT_MAX_PTS, DEFAULT_DELIM, _, _>(
+    block_on(parse_hpgl_async::<DEFAULT_DELIM, _, _>(
         bytes.as_slice(),
         &config,
         &mut ac,
@@ -261,28 +260,13 @@ fn async_token_too_long_returns_err() {
     let config = Config::default();
     let mut handler = RecordingHandler::new();
     let mut io_buf = [0u8; DEFAULT_IO_BUF_SIZE];
-    let result = block_on(parse_hpgl_async::<DEFAULT_MAX_PTS, DEFAULT_DELIM, _, _>(
+    let result = block_on(parse_hpgl_async::<DEFAULT_DELIM, _, _>(
         input,
         &config,
         &mut handler,
         &mut io_buf,
     ));
     assert_eq!(result, Err(ParseError::TokenTooLong));
-}
-
-#[test]
-fn async_too_many_points_returns_err() {
-    let input: &[u8] = b"PD100,200,100,200,100,200,100,200,100,200;\x0A";
-    let config = Config::default();
-    let mut handler = RecordingHandler::new();
-    let mut io_buf = [0u8; DEFAULT_IO_BUF_SIZE];
-    let result = block_on(parse_hpgl_async::<4, DEFAULT_DELIM, _, _>(
-        input,
-        &config,
-        &mut handler,
-        &mut io_buf,
-    ));
-    assert_eq!(result, Err(ParseError::TooManyPoints));
 }
 
 #[test]
@@ -303,7 +287,7 @@ fn async_pd_large_streams_correctly() {
     let config = Config::default();
     let mut handler = RecordingHandler::new();
     let mut io_buf = [0u8; DEFAULT_IO_BUF_SIZE];
-    block_on(parse_hpgl_async::<DEFAULT_MAX_PTS, DEFAULT_DELIM, _, _>(
+    block_on(parse_hpgl_async::<DEFAULT_DELIM, _, _>(
         input.as_slice(),
         &config,
         &mut handler,
@@ -445,7 +429,7 @@ fn async_small_io_buf() {
         cur: 0,
     };
     let mut io_buf = [0u8; 64];
-    block_on(parse_hpgl_async::<DEFAULT_MAX_PTS, DEFAULT_DELIM, _, _>(
+    block_on(parse_hpgl_async::<DEFAULT_DELIM, _, _>(
         reader,
         &config,
         &mut async_c,
@@ -540,14 +524,9 @@ fn async_pipe_reader_simulates_packet_arrival() {
             let mut handler = RecordingHandler::new();
             let mut io_buf = [0u8; DEFAULT_IO_BUF_SIZE];
 
-            parse_hpgl_async::<DEFAULT_MAX_PTS, DEFAULT_DELIM, _, _>(
-                reader,
-                &config,
-                &mut handler,
-                &mut io_buf,
-            )
-            .await
-            .expect("pipe parse failed");
+            parse_hpgl_async::<DEFAULT_DELIM, _, _>(reader, &config, &mut handler, &mut io_buf)
+                .await
+                .expect("pipe parse failed");
 
             handler.events
         };
