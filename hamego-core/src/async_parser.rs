@@ -45,21 +45,18 @@ pub enum ParseError<E> {
 pub trait AsyncCommandHandler {
     async fn select_pen(&mut self, pen: usize);
     async fn pen_up(&mut self, x: f64, y: f64);
-    /// Called before the first point of a PD segment.
     async fn pen_down_begin(&mut self);
     /// Called for each point in the current PD segment (scaled SVG coordinates).
     async fn pen_down_point(&mut self, x: f64, y: f64);
-    /// Called after the last point of a PD segment.
     async fn pen_down_end(&mut self);
     /// Called when `DELIM` byte is received — signals end of HPGL transmission.
     async fn complete(&mut self);
 }
 
 // ---------------------------------------------------------------------------
-// Internal state machine
+// Internal helpers
 // ---------------------------------------------------------------------------
 
-/// Two-byte command prefix accumulator.
 #[derive(Default)]
 struct Prefix {
     buf: [u8; 2],
@@ -84,7 +81,6 @@ impl Prefix {
     }
 }
 
-/// Token accumulator for a single number.
 struct Token {
     buf: [u8; TOKEN_BUF_SIZE],
     len: usize,
@@ -99,7 +95,7 @@ impl Token {
     }
     fn push(&mut self, b: u8) -> bool {
         if self.len >= TOKEN_BUF_SIZE {
-            return false; // overflow
+            return false;
         }
         self.buf[self.len] = b;
         self.len += 1;
@@ -118,23 +114,13 @@ impl Token {
     }
 }
 
-/// Parser state.
 enum State {
-    /// Reading the 2-byte command prefix.
     Command,
-    /// Inside `SP` body — reading pen number digits.
     SpBody,
-    /// Inside `PU` body — streaming coordinate pairs, keeping only the last.
     PuCoords,
-    /// Inside `PD` body — streaming coordinate pairs as events.
     PdCoords,
-    /// Unknown command — discard until `;` or DELIM.
     Skip,
 }
-
-// ---------------------------------------------------------------------------
-// Scale helper (inline, no heap)
-// ---------------------------------------------------------------------------
 
 #[inline]
 fn scale_xy(raw_x: f64, raw_y: f64, config: &Config) -> (f64, f64) {
@@ -142,26 +128,303 @@ fn scale_xy(raw_x: f64, raw_y: f64, config: &Config) -> (f64, f64) {
 }
 
 // ---------------------------------------------------------------------------
-// parse_hpgl_async
+// Internal parse error (no IO variant — used inside StateMachine)
+// ---------------------------------------------------------------------------
+
+enum InnerError {
+    TooManyPoints,
+    TokenTooLong,
+}
+
+impl<E> From<InnerError> for ParseError<E> {
+    fn from(e: InnerError) -> Self {
+        match e {
+            InnerError::TooManyPoints => ParseError::TooManyPoints,
+            InnerError::TokenTooLong => ParseError::TokenTooLong,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// StateMachine
+// ---------------------------------------------------------------------------
+
+struct StateMachine {
+    state: State,
+    prefix: Prefix,
+    token: Token,
+    /// Last PU position (scaled SVG coords) carried into the next PD as its first point.
+    pu_carry: Option<(f64, f64)>,
+    /// Unscaled X of the current PU coordinate pair; `None` until the first comma is seen.
+    pu_pending_x: Option<f64>,
+    /// Unscaled X of the current PD coordinate pair; `None` until the first comma is seen.
+    pd_pending_x: Option<f64>,
+    /// Number of points emitted so far in the active PD path (used to enforce `MAX_PTS`).
+    pd_point_count: usize,
+    /// `true` if any byte has been received since the last `complete()` call.
+    /// Prevents a spurious `complete()` when DELIM was the very last byte.
+    has_pending_data: bool,
+    config: Config,
+}
+
+impl StateMachine {
+    fn new(config: &Config) -> Self {
+        Self {
+            state: State::Command,
+            prefix: Prefix::default(),
+            token: Token::new(),
+            pu_carry: None,
+            pu_pending_x: None,
+            pd_pending_x: None,
+            pd_point_count: 0,
+            has_pending_data: false,
+            config: config.clone(),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Per-state byte handlers
+    // -----------------------------------------------------------------------
+
+    async fn handle_command_byte<H: AsyncCommandHandler>(&mut self, b: u8, handler: &mut H) {
+        if b == b';' {
+            self.prefix.reset();
+            return;
+        }
+        self.prefix.push(b);
+        if self.prefix.is_full() {
+            if self.prefix.matches(b"PD") {
+                handler.pen_down_begin().await;
+                if let Some((cx, cy)) = self.pu_carry.take() {
+                    handler.pen_down_point(cx, cy).await;
+                    self.pd_point_count = 1;
+                } else {
+                    self.pd_point_count = 0;
+                }
+                self.pd_pending_x = None;
+                self.token.reset();
+                self.state = State::PdCoords;
+            } else if self.prefix.matches(b"PU") {
+                self.pu_pending_x = None;
+                self.pd_pending_x = None;
+                self.token.reset();
+                self.state = State::PuCoords;
+            } else if self.prefix.matches(b"SP") {
+                self.token.reset();
+                self.state = State::SpBody;
+            } else {
+                self.state = State::Skip;
+            }
+            self.prefix.reset();
+        }
+    }
+
+    async fn handle_pd_byte<const MAX_PTS: usize, H: AsyncCommandHandler>(
+        &mut self,
+        b: u8,
+        handler: &mut H,
+    ) -> Result<(), InnerError> {
+        if b == b';' {
+            if let (Some(rx), Some(ry)) = (self.pd_pending_x.take(), self.token.parse_f64()) {
+                let (sx, sy) = scale_xy(rx, ry, &self.config);
+                if self.pd_point_count >= MAX_PTS {
+                    return Err(InnerError::TooManyPoints);
+                }
+                handler.pen_down_point(sx, sy).await;
+                self.pd_point_count += 1;
+            }
+            self.pd_pending_x = None;
+            self.token.reset();
+            self.pd_point_count = 0;
+            handler.pen_down_end().await;
+            self.state = State::Command;
+        } else if b == b',' {
+            if self.pd_pending_x.is_none() {
+                self.pd_pending_x = self.token.parse_f64();
+                self.token.reset();
+            } else {
+                if let (Some(rx), Some(ry)) = (self.pd_pending_x.take(), self.token.parse_f64()) {
+                    let (sx, sy) = scale_xy(rx, ry, &self.config);
+                    if self.pd_point_count >= MAX_PTS {
+                        return Err(InnerError::TooManyPoints);
+                    }
+                    handler.pen_down_point(sx, sy).await;
+                    self.pd_point_count += 1;
+                }
+                self.token.reset();
+            }
+        } else if !self.token.push(b) {
+            return Err(InnerError::TokenTooLong);
+        }
+        Ok(())
+    }
+
+    async fn handle_pu_byte<H: AsyncCommandHandler>(
+        &mut self,
+        b: u8,
+        handler: &mut H,
+    ) -> Result<(), InnerError> {
+        if b == b';' {
+            if let (Some(rx), Some(ry)) = (self.pu_pending_x.take(), self.token.parse_f64()) {
+                let (sx, sy) = scale_xy(rx, ry, &self.config);
+                self.pu_carry = Some((sx, sy));
+                handler.pen_up(sx, sy).await;
+            }
+            self.token.reset();
+            self.state = State::Command;
+        } else if b == b',' {
+            if self.pu_pending_x.is_none() {
+                self.pu_pending_x = self.token.parse_f64();
+                self.token.reset();
+            } else {
+                if let (Some(rx), Some(ry)) = (self.pu_pending_x.take(), self.token.parse_f64()) {
+                    let (sx, sy) = scale_xy(rx, ry, &self.config);
+                    self.pu_carry = Some((sx, sy));
+                    handler.pen_up(sx, sy).await;
+                }
+                self.token.reset();
+            }
+        } else if !self.token.push(b) {
+            return Err(InnerError::TokenTooLong);
+        }
+        Ok(())
+    }
+
+    async fn handle_sp_byte<H: AsyncCommandHandler>(
+        &mut self,
+        b: u8,
+        handler: &mut H,
+    ) -> Result<(), InnerError> {
+        if b == b';' {
+            if let Some(pen) = self.token.parse_usize() {
+                handler.select_pen(pen).await;
+            }
+            self.token.reset();
+            self.state = State::Command;
+        } else if !self.token.push(b) {
+            return Err(InnerError::TokenTooLong);
+        }
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // DELIM flush: flush current state, reset, call complete()
+    // -----------------------------------------------------------------------
+
+    async fn flush_delim<H: AsyncCommandHandler>(&mut self, handler: &mut H) {
+        match self.state {
+            State::PdCoords => {
+                if let (Some(rx), Some(ry)) = (self.pd_pending_x.take(), self.token.parse_f64()) {
+                    let (sx, sy) = scale_xy(rx, ry, &self.config);
+                    handler.pen_down_point(sx, sy).await;
+                }
+                handler.pen_down_end().await;
+            }
+            State::PuCoords => {
+                if let (Some(rx), Some(ry)) = (self.pu_pending_x.take(), self.token.parse_f64()) {
+                    let (sx, sy) = scale_xy(rx, ry, &self.config);
+                    self.pu_carry = Some((sx, sy));
+                    handler.pen_up(sx, sy).await;
+                }
+            }
+            State::SpBody => {
+                if let Some(pen) = self.token.parse_usize() {
+                    handler.select_pen(pen).await;
+                }
+            }
+            _ => {}
+        }
+        // reset all state
+        self.pu_pending_x = None;
+        self.pd_pending_x = None;
+        self.pd_point_count = 0;
+        self.token.reset();
+        self.prefix.reset();
+        self.pu_carry = None;
+        self.has_pending_data = false;
+        self.state = State::Command;
+        handler.complete().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // EOF flush: flush trailing state, call complete() if pending
+    // -----------------------------------------------------------------------
+
+    async fn flush_eof<H: AsyncCommandHandler>(&mut self, handler: &mut H) {
+        if !self.has_pending_data {
+            return;
+        }
+        match self.state {
+            State::PdCoords => {
+                handler.pen_down_end().await;
+            }
+            State::PuCoords => {
+                if let (Some(rx), Some(ry)) = (self.pu_pending_x, self.token.parse_f64()) {
+                    let (sx, sy) = scale_xy(rx, ry, &self.config);
+                    handler.pen_up(sx, sy).await;
+                }
+            }
+            State::SpBody => {
+                if let Some(pen) = self.token.parse_usize() {
+                    handler.select_pen(pen).await;
+                }
+            }
+            _ => {}
+        }
+        handler.complete().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Main byte dispatch
+    // -----------------------------------------------------------------------
+
+    async fn feed_byte<const MAX_PTS: usize, const DELIM: u8, H: AsyncCommandHandler>(
+        &mut self,
+        b: u8,
+        handler: &mut H,
+    ) -> Result<(), InnerError> {
+        self.has_pending_data = true;
+
+        if b == DELIM {
+            self.flush_delim(handler).await;
+            return Ok(());
+        }
+
+        match self.state {
+            State::Command => {
+                self.handle_command_byte(b, handler).await;
+            }
+            State::PdCoords => {
+                self.handle_pd_byte::<MAX_PTS, H>(b, handler).await?;
+            }
+            State::PuCoords => {
+                self.handle_pu_byte(b, handler).await?;
+            }
+            State::SpBody => {
+                self.handle_sp_byte(b, handler).await?;
+            }
+            State::Skip => {
+                if b == b';' {
+                    self.state = State::Command;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// parse_hpgl_async — public entry point (IO loop only)
 // ---------------------------------------------------------------------------
 
 /// Parse HPGL from an async byte reader, streaming events to `handler`.
 ///
 /// # Generic parameters
-/// - `MAX_PTS` — maximum coordinate pairs per PD path. Returns
-///   [`ParseError::TooManyPoints`] if exceeded. Use [`DEFAULT_MAX_PTS`].
-/// - `DELIM` — byte that signals end of one transmission, causing
-///   `handler.complete()` to be called. Use [`DEFAULT_DELIM`] (`0x0A`).
+/// - `MAX_PTS` — maximum coordinate pairs per PD path.
+/// - `DELIM` — byte that signals end of one HPGL transmission.
 ///
 /// # Parameters
-/// - `io_buf` — externally-owned I/O read buffer. Caller controls size and
-///   lifetime; use a `static` buffer behind `Mutex` on embedded targets.
-///
-/// # Behaviour
-/// - Commands are delimited by `;`.
-/// - DELIM resets state and continues parsing (multiple transmissions supported).
-/// - EOF always calls `complete()` after flushing any pending state.
-#[allow(unused_assignments)] // macro_rules! do_complete! resets carry/pt_count; compiler sees them as dead assignments
+/// - `io_buf` — externally-owned I/O read buffer.
 pub async fn parse_hpgl_async<const MAX_PTS: usize, const DELIM: u8, R, H>(
     mut reader: R,
     config: &Config,
@@ -172,34 +435,7 @@ where
     R: Read,
     H: AsyncCommandHandler,
 {
-    let mut state = State::Command;
-    let mut prefix = Prefix::default();
-    let mut token = Token::new();
-    // Carry-over point from the last PU (scaled coords)
-    let mut carry: Option<(f64, f64)> = None;
-    // For PuCoords: last seen x (unscaled), to overwrite on each new pair
-    let mut pu_x: Option<f64> = None;
-    // For PdCoords: x of current pair (waiting for y)
-    let mut pd_x: Option<f64> = None;
-    // Points emitted in the current PD path
-    let mut pt_count: usize = 0;
-    // Track whether we have pending data since the last complete()
-    let mut pending: bool = false;
-
-    // Flush helpers as closures are not async — use a macro for the DELIM path
-    macro_rules! do_complete {
-        () => {
-            pu_x = None;
-            pd_x = None;
-            pt_count = 0;
-            token.reset();
-            prefix.reset();
-            carry = None;
-            pending = false;
-            state = State::Command;
-            handler.complete().await;
-        };
-    }
+    let mut sm = StateMachine::new(config);
 
     loop {
         let n = match reader.read(io_buf).await {
@@ -207,208 +443,13 @@ where
             Ok(n) => n,
             Err(e) => return Err(ParseError::Io(e)),
         };
-
         for &b in &io_buf[..n] {
-            pending = true;
-            // ----------------------------------------------------------------
-            // DELIM — flush current state, fire complete(), reset
-            // ----------------------------------------------------------------
-            if b == DELIM {
-                match state {
-                    State::PdCoords => {
-                        // flush final pair if complete, drop unpaired x
-                        if let (Some(rx), Some(ry)) = (pd_x.take(), token.parse_f64()) {
-                            let (sx, sy) = scale_xy(rx, ry, config);
-                            if pt_count < MAX_PTS {
-                                handler.pen_down_point(sx, sy).await;
-                            }
-                        }
-                        handler.pen_down_end().await;
-                    }
-                    State::PuCoords => {
-                        // flush last seen pu pair
-                        if let (Some(x), Some(y)) = (pu_x.take(), token.parse_f64()) {
-                            let (sx, sy) = scale_xy(x, y, config);
-                            carry = Some((sx, sy));
-                            handler.pen_up(sx, sy).await;
-                        }
-                        token.reset();
-                    }
-                    State::SpBody => {
-                        if let Some(pen) = token.parse_usize() {
-                            handler.select_pen(pen).await;
-                        }
-                        token.reset();
-                    }
-                    _ => {}
-                }
-                do_complete!();
-                continue;
-            }
-
-            // ----------------------------------------------------------------
-            // State machine
-            // ----------------------------------------------------------------
-            match state {
-                // ------------------------------------------------------------
-                State::Command => {
-                    if b == b';' {
-                        // Empty or single-char command — ignore
-                        prefix.reset();
-                        continue;
-                    }
-                    prefix.push(b);
-                    if prefix.is_full() {
-                        if prefix.matches(b"PD") {
-                            handler.pen_down_begin().await;
-                            // Emit carry-over point from last PU
-                            if let Some((cx, cy)) = carry.take() {
-                                handler.pen_down_point(cx, cy).await;
-                                pt_count = 1;
-                            } else {
-                                pt_count = 0;
-                            }
-                            pd_x = None;
-                            token.reset();
-                            state = State::PdCoords;
-                        } else if prefix.matches(b"PU") {
-                            pu_x = None;
-                            pd_x = None;
-                            token.reset();
-                            state = State::PuCoords;
-                        } else if prefix.matches(b"SP") {
-                            token.reset();
-                            state = State::SpBody;
-                        } else {
-                            state = State::Skip;
-                        }
-                        prefix.reset();
-                    }
-                }
-
-                // ------------------------------------------------------------
-                State::PdCoords => {
-                    if b == b';' {
-                        // Flush final pair if complete (x already stored, token has y)
-                        if let (Some(rx), Some(ry)) = (pd_x.take(), token.parse_f64()) {
-                            let (sx, sy) = scale_xy(rx, ry, config);
-                            if pt_count >= MAX_PTS {
-                                return Err(ParseError::TooManyPoints);
-                            }
-                            handler.pen_down_point(sx, sy).await;
-                            pt_count += 1;
-                        }
-                        // Drop unpaired x (odd coordinate count — malformed input)
-                        pd_x = None;
-                        token.reset();
-                        pt_count = 0;
-                        handler.pen_down_end().await;
-                        state = State::Command;
-                    } else if b == b',' {
-                        if pd_x.is_none() {
-                            // First of pair: store x
-                            pd_x = token.parse_f64();
-                            token.reset();
-                        } else {
-                            // Second of pair: emit point
-                            if let (Some(rx), Some(ry)) = (pd_x.take(), token.parse_f64()) {
-                                let (sx, sy) = scale_xy(rx, ry, config);
-                                if pt_count >= MAX_PTS {
-                                    return Err(ParseError::TooManyPoints);
-                                }
-                                handler.pen_down_point(sx, sy).await;
-                                pt_count += 1;
-                            }
-                            token.reset();
-                        }
-                    } else {
-                        if !token.push(b) {
-                            return Err(ParseError::TokenTooLong);
-                        }
-                    }
-                }
-
-                // ------------------------------------------------------------
-                State::PuCoords => {
-                    if b == b';' {
-                        // Flush last pair: pu_x already set, token has y
-                        if let (Some(rx), Some(ry)) = (pu_x.take(), token.parse_f64()) {
-                            let (sx, sy) = scale_xy(rx, ry, config);
-                            carry = Some((sx, sy));
-                            handler.pen_up(sx, sy).await;
-                        }
-                        token.reset();
-                        state = State::Command;
-                    } else if b == b',' {
-                        if pu_x.is_none() {
-                            // First of pair: x
-                            pu_x = token.parse_f64();
-                            token.reset();
-                        } else {
-                            // Second of pair: overwrite carry with new y
-                            if let (Some(rx), Some(ry)) = (pu_x.take(), token.parse_f64()) {
-                                let (sx, sy) = scale_xy(rx, ry, config);
-                                carry = Some((sx, sy));
-                                handler.pen_up(sx, sy).await;
-                            }
-                            token.reset();
-                            // Stay in PuCoords — more pairs may follow
-                        }
-                    } else {
-                        if !token.push(b) {
-                            return Err(ParseError::TokenTooLong);
-                        }
-                    }
-                }
-
-                // ------------------------------------------------------------
-                State::SpBody => {
-                    if b == b';' {
-                        if let Some(pen) = token.parse_usize() {
-                            handler.select_pen(pen).await;
-                        }
-                        token.reset();
-                        state = State::Command;
-                    } else {
-                        if !token.push(b) {
-                            return Err(ParseError::TokenTooLong);
-                        }
-                    }
-                }
-
-                // ------------------------------------------------------------
-                State::Skip => {
-                    if b == b';' {
-                        state = State::Command;
-                    }
-                    // else: discard
-                }
-            }
+            sm.feed_byte::<MAX_PTS, DELIM, H>(b, handler)
+                .await
+                .map_err(ParseError::from)?;
         }
     }
 
-    // EOF: flush trailing state and call complete() only if there was data
-    // since the last complete() (avoids double-complete when DELIM was last byte)
-    if pending {
-        match state {
-            State::PdCoords => {
-                handler.pen_down_end().await;
-            }
-            State::PuCoords => {
-                if let (Some(rx), Some(ry)) = (pu_x, token.parse_f64()) {
-                    let (sx, sy) = scale_xy(rx, ry, config);
-                    handler.pen_up(sx, sy).await;
-                }
-            }
-            State::SpBody => {
-                if let Some(pen) = token.parse_usize() {
-                    handler.select_pen(pen).await;
-                }
-            }
-            _ => {}
-        }
-        handler.complete().await;
-    }
-
+    sm.flush_eof(handler).await;
     Ok(())
 }
